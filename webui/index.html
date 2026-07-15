@@ -1,0 +1,1325 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OBSCURA · story pipeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Spectral:ital,wght@0,400;0,600;0,700;1,400;1,600&display=swap" rel="stylesheet">
+<style>
+/* base styles ported 1:1 from the Story Bot artifact */
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;height:100%;background:#0b0d10;}
+body{font-family:'IBM Plex Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased;color:#e8eaf0;}
+a{color:#f2b64a;text-decoration:none;}
+a:hover{color:#f7c86b;}
+::selection{background:rgba(242,182,74,.28);color:#fff;}
+::-webkit-scrollbar{width:11px;height:11px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:#242a35;border-radius:6px;border:3px solid #0b0d10;}
+::-webkit-scrollbar-thumb:hover{background:#333a49;}
+input::placeholder{color:#5b6270;}
+@keyframes obPulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+@keyframes obUp{from{opacity:0;transform:translateY(9px);}to{opacity:1;transform:none;}}
+@keyframes obToast{from{opacity:0;transform:translate(-50%,14px);}to{opacity:1;transform:translate(-50%,0);}}
+@keyframes obFade{from{opacity:0;}to{opacity:1;}}
+@keyframes obSpin{to{transform:rotate(360deg);}}
+@keyframes obSlide{0%{transform:translateX(-115%);}100%{transform:translateX(320%);}}
+@keyframes obShine{0%{transform:translateX(-100%);}60%,100%{transform:translateX(260%);}}
+.obSpin{display:inline-block;animation:obSpin .9s linear infinite;}
+.obIndet{animation:obSlide 1.15s ease-in-out infinite;}
+.obShine{position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.4),transparent);animation:obShine 1.5s ease-in-out infinite;}
+@keyframes obPvFade{from{opacity:0;}to{opacity:1;}}
+@keyframes obPvPop{0%{transform:scale(.6);opacity:0;}70%{transform:scale(1.08);opacity:1;}100%{transform:scale(1);}}
+@keyframes obPvSweep{from{background-size:0% 100%;}to{background-size:100% 100%;}}
+button{font:inherit;}
+/* hover/focus classes standing in for the artifact's style-hover / style-focus attrs */
+.hvB:hover{filter:brightness(1.08);}
+.hvB2:hover{filter:brightness(1.1);}
+.hvBd:hover{border-color:#3a4453!important;}
+.hvNeu:hover{border-color:#3a4453!important;color:#dfe3ea!important;}
+.hvRej:hover{border-color:#4a3236!important;color:#f2777c!important;}
+.hvBrief:hover{border-color:#3a4453!important;color:#fff!important;}
+.hvNav:hover{background:rgba(255,255,255,.045);}
+.hvMenu:hover{background:rgba(255,255,255,.05)!important;}
+.hvGold:hover{color:#f2b64a!important;}
+.hvX:hover{background:#242a35!important;color:#fff!important;}
+.hvW:hover{color:#fff!important;}
+.hvChip:hover{border-color:#4fd1c5!important;color:#7ee6db!important;background:rgba(79,209,197,.08)!important;}
+.sIn:focus{border-color:#3a4453!important;outline:none;}
+video{display:block;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toastZone"></div>
+<script>
+'use strict';
+/* ============================================================================
+   OBSCURA web console -- faithful port of the Story Bot artifact UI, wired to
+   the real pipeline API (web.py). Constants, styles and copy text come from
+   the original component; the queue view additionally surfaces real render
+   state, the preview player and ship/re-roll/re-voice controls.
+   ========================================================================= */
+
+// ---- constants (verbatim from the artifact component) ----------------------
+const CATS = ['Strange places','Murder mysteries','Billionaire stories','Science facts','Unexplained events','Abandoned places','Unsolved mysteries','Businesses','Brands','Technology','Weird experiments'];
+const TONES = ['Mysterious / eerie','Cinematic / dramatic','Dark / unsettling','Suspenseful / thriller','Documentary / informative'];
+const CATCOLOR = {'Strange places':'#6ea8fe','Murder mysteries':'#f2777c','Billionaire stories':'#f2b64a','Science facts':'#4fd1c5','Unexplained events':'#a78bfa','Abandoned places':'#9aa3b2','Unsolved mysteries':'#c084fc','Businesses':'#5eead4','Brands':'#fb923c','Technology':'#60a5fa','Weird experiments':'#a3e635'};
+const TONECOLOR = {'Mysterious / eerie':'#a78bfa','Cinematic / dramatic':'#f2b64a','Dark / unsettling':'#f2777c','Suspenseful / thriller':'#fb923c','Documentary / informative':'#4fd1c5'};
+const WEIGHTS = [1.3,1.2,1.0,1.5,1.4,0.7,1.0,0.9];
+const CRITERIA = [
+  {label:'Interest',weight:'×1.3',desc:'How intriguing the premise is the instant you hear it.',one:'Common knowledge — viewers already know how it ends.',five:'A premise so strange the viewer physically can’t scroll past.'},
+  {label:'Engagement',weight:'×1.2',desc:'Whether the story keeps pulling viewers to the end.',one:'Front-loaded — the title is the best part and it fizzles.',five:'Escalates the whole way with a loop that only closes at the payoff.'},
+  {label:'Originality',weight:'×1.0',desc:'How fresh or untold it is on YouTube right now.',one:'Ten big channels covered it this year.',five:'Barely documented — no major channel has told it.'},
+  {label:'Hook strength',weight:'×1.5',desc:'How hard the first line grabs. Critical for Shorts.',one:'Slow, generic opener that earns a swipe.',five:'The first three seconds are unskippable and demand an answer.'},
+  {label:'Virality',weight:'×1.4',desc:'How shareable and clickable it is.',one:'Niche — hard to package into a title or thumbnail.',five:'Begs to be shared, screenshotted and argued about in the comments.'},
+  {label:'Factual richness',weight:'×0.7',desc:'Whether there’s enough real detail to fill the runtime.',one:'One thin fact stretched past its limit.',five:'Layers of verifiable specifics — names, dates and a twist.'},
+  {label:'Emotional impact',weight:'×1.0',desc:'The strength of the feeling it leaves behind.',one:'Flat and forgettable a minute later.',five:'Lands a real gut-punch of dread, awe or disbelief.'},
+  {label:'Faceless-friendly',weight:'×0.9',desc:'How well it works with stock/AI visuals and voiceover.',one:'Needs an on-camera host or has nothing to show.',five:'Rich, ready-made visuals — carries entirely on voiceover and b-roll.'},
+];
+const TONEGUIDE = [
+  {tone:'Mysterious / eerie',desc:'Withhold answers. Build the question, never rush the resolution. Best for unsolved cases, strange places and unexplained signals.'},
+  {tone:'Cinematic / dramatic',desc:'Big, sweeping, high-stakes narration. Best for billionaire falls, disasters and once-in-history events.'},
+  {tone:'Dark / unsettling',desc:'Cold and restrained — matter-of-fact about disturbing things. Best for experiments, cover-ups and true crime.'},
+  {tone:'Suspenseful / thriller',desc:'Tight pacing, a ticking clock, cliffhanger beats. Best for heists, manhunts and countdowns.'},
+  {tone:'Documentary / informative',desc:'Authoritative, clear and curiosity-led. Best for science facts, how brands work and technology.'},
+];
+const JOBSTATE = {
+  queued:{label:'QUEUED',color:'#8fbcff',bg:'rgba(110,168,254,.13)',line:'waiting for the render worker',pct:8},
+  tts:{label:'RECORDING',color:'#f2b64a',bg:'rgba(242,182,74,.12)',line:'recording narration…',pct:30},
+  clips:{label:'FOOTAGE',color:'#f2b64a',bg:'rgba(242,182,74,.12)',line:'hunting stock footage…',pct:55},
+  assembling:{label:'CUTTING',color:'#f2b64a',bg:'rgba(242,182,74,.12)',line:'cutting the video…',pct:80},
+  preview:{label:'PACKING',color:'#f2b64a',bg:'rgba(242,182,74,.12)',line:'packing the preview…',pct:93},
+  blocked:{label:'BLOCKED',color:'#fb923c',bg:'rgba(251,146,60,.13)',line:''},
+  failed:{label:'FAILED',color:'#e0757a',bg:'rgba(226,90,95,.12)',line:''},
+};
+// the four visible render stages, in order, for the mini stage-tracker
+const RENDER_STAGES=[['tts','Narration'],['clips','Footage'],['assembling','Cutting'],['preview','Preview']];
+const RENDER_ORDER=['queued','tts','clips','assembling','preview'];
+
+// ---- state ------------------------------------------------------------------
+const S = {
+  view:'feed', stories:[], botName:'SCOUT', workspaceName:'OBSCURA', threshold:4,
+  filterRating:'all', filterStatus:'all', filterCategory:'all', filterTone:'all',
+  sortBy:'score', search:'', openDropdown:null, openStory:null, toast:null,
+  modalTab:'overview', tonesApi:[], busyGen:false, busyRegen:{}, loaded:false,
+  gen:null, genCount:3, genMax:10, costs:null, settings:null, catCatalog:[],
+  composer:false, genCats:[], genTones:[], selStory:null,
+  styleStory:null, prod:null, playing:null,
+  feedSort:'newest', feedStatus:'all', feedCat:'all', feedTone:'all',
+};
+let toastTimer=null, lastSnapshot='', lastGen='', resetDetailScroll=false, lastAppHtml='', _renderSilent=false, lastTouch=0, lastView=null, _bgPending=false;
+// background (poll-driven) re-render: skipped while a modal/dropdown is open, or
+// while you're actively clicking, so live data never disrupts what you're doing.
+// User actions call renderApp()/repaintStyle() directly.
+function bgRender(){ _renderSilent=true; try{ renderApp(); } finally{ _renderSilent=false; } }
+// any pointer/keyboard interaction defers the next background repaint briefly, so
+// a poll can't rebuild the page out from under a click mid-edit.
+function touchNow(){ try{ lastTouch=Date.now(); }catch(e){} }
+document.addEventListener('pointerdown',touchNow,true);
+document.addEventListener('input',touchNow,true);
+
+function esc(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function tint(hex,a){ return 'rgba('+parseInt(hex.slice(1,3),16)+','+parseInt(hex.slice(3,5),16)+','+parseInt(hex.slice(5,7),16)+','+a+')'; }
+function overall(sc){ let s=0,tw=0; for(let i=0;i<8;i++){ s+=sc[i]*WEIGHTS[i]; tw+=WEIGHTS[i]; } return s/tw; }
+function envatoUrl(kw){ return 'https://elements.envato.com/stock-video/'+encodeURIComponent(kw.trim().toLowerCase()).replace(/%20/g,'+')+'?orientation=vertical'; }
+function toneKeyOf(label){ const t=S.tonesApi.find(x=>x.label===label); return t?t.key:null; }
+function fmtDur(sec){ if(sec==null) return ''; const s=Math.round(sec); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+function stamp(created){ const age=Date.now()/1000-created; if(age<5400) return 'just now'; const d=new Date(created*1000), now=new Date(); if(d.toDateString()===now.toDateString()) return 'earlier today'; return d.toLocaleDateString(undefined,{month:'short',day:'numeric'}); }
+
+// Toast lives in its own overlay (#toastZone) so showing/hiding it never
+// rebuilds the app — previously every toast caused TWO full-page re-renders.
+function paintToast(){
+  const z=document.getElementById('toastZone'); if(!z) return;
+  z.innerHTML=S.toast?'<div style="position:fixed;bottom:28px;left:50%;z-index:200;transform:translateX(-50%);display:flex;align-items:center;gap:10px;background:#181d26;border:1px solid #2a313d;border-radius:11px;padding:12px 18px;box-shadow:0 16px 44px rgba(0,0,0,.55);animation:obToast .25s ease;"><span style="width:22px;height:22px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:linear-gradient(150deg,#f2b64a,#c8842a);color:#1a1206;border-radius:6px;'+MONO+'font-weight:600;font-size:11px;">'+esc(S.botName.charAt(0))+'</span><span style="font-size:13.5px;color:#e8eaf0;font-weight:500;">'+esc(S.toast)+'</span></div>':'';
+}
+function toast(m){ clearTimeout(toastTimer); S.toast=m; paintToast(); toastTimer=setTimeout(()=>{S.toast=null;paintToast();},2600); }
+
+// ---- API --------------------------------------------------------------------
+async function refresh(force){
+  try{
+    const r=await fetch('/api/state'); if(!r.ok) throw new Error(r.status);
+    const d=await r.json();
+    const snap=JSON.stringify(d);
+    S.botName=d.botName; S.workspaceName=d.workspaceName; S.threshold=d.threshold; S.tonesApi=d.tones; S.loaded=true;
+    if(d.genMax) S.genMax=d.genMax;
+    if(d.gen&&!S.gen) S.gen=d.gen;               // seed the panel on first load
+    if(d.settings) S.settings=d.settings;
+    if(d.catCatalog) S.catCatalog=d.catCatalog;
+    if(snap!==lastSnapshot||force){ lastSnapshot=snap; S.stories=d.stories; if(force) renderApp(); else bgRender(); }
+  }catch(e){ if(!S.loaded){ document.getElementById('app').innerHTML='<div style="padding:60px;text-align:center;color:#8b93a2;font-family:\'IBM Plex Mono\',monospace;">can’t reach the pipeline API… retrying</div>'; } }
+}
+async function pollGen(){
+  try{
+    const r=await fetch('/api/gen'); if(!r.ok) return;
+    const g=await r.json(); const j=JSON.stringify(g);
+    const wasActive=S.gen&&S.gen.active;
+    S.gen=g;
+    if(j!==lastGen){ lastGen=j; bgRender(); }
+    if(wasActive&&!g.active){                      // just finished
+      S.busyGen=false;
+      if(g.error) toast('generation failed: '+g.error);
+      else if(g.posted) toast(S.botName+' posted '+g.posted+' new draft'+(g.posted!==1?'s':''));
+      await refresh(true);
+    }
+  }catch(e){}
+}
+async function pollCosts(){
+  if(S.view!=='costs') return;
+  try{ const r=await fetch('/api/costs'); if(r.ok){ S.costs=await r.json(); bgRender(); } }catch(e){}
+}
+async function act(id,action,extra){
+  try{
+    const r=await fetch('/api/story/'+id+'/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action},extra||{}))});
+    const d=await r.json(); toast(d.msg||'done'); await refresh(true);
+  }catch(e){ toast('action failed: '+e); }
+}
+async function saveSettings(patch,silent){
+  // silent = the caller already updated S.settings precisely and repainted the
+  // Style editor subtree, so don't re-merge (a shallow cap merge here would
+  // clobber the full cap) or full-render — just persist.
+  if(!silent){
+    S.settings=Object.assign({render:{},categories:[]},S.settings||{});
+    if(patch.render) S.settings.render=Object.assign({},S.settings.render,patch.render);
+    if(patch.categories!==undefined) S.settings.categories=patch.categories;
+    if(patch.maxRenders!==undefined) S.settings.maxRenders=patch.maxRenders;
+    if(patch.dailyTarget!==undefined) S.settings.dailyTarget=patch.dailyTarget;
+    if(patch.autogen!==undefined) S.settings.autogen=patch.autogen;
+    renderApp();
+  }
+  try{ await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}); }
+  catch(e){ toast('settings save failed: '+e); }
+}
+function catOn(key){ const c=(S.settings&&S.settings.categories)||[]; return c.length===0||c.includes(key); }
+function toggleCat(key){
+  const all=(S.catCatalog||[]).map(x=>x.key);
+  let cur=(S.settings&&S.settings.categories&&S.settings.categories.length)?S.settings.categories.slice():all.slice();
+  cur = cur.includes(key)? cur.filter(k=>k!==key) : cur.concat([key]);
+  if(cur.length===0){ toast('keep at least one category'); return; }
+  saveSettings({categories: cur.length===all.length? [] : cur});
+}
+function setOpt(id,key){
+  const e=S.stories.find(s=>s.id===id); if(!e) return;
+  const cur=(e.opts&&e.opts[key])!==false; const opts={}; opts[key]=!cur;
+  e.opts=Object.assign({},e.opts,opts);   // optimistic
+  act(id,'opts',{opts});
+}
+function injectFonts(fonts){
+  let css='';
+  (fonts||[]).forEach(f=>{ if(f.url) css+='@font-face{font-family:"'+f.name.replace(/["\\]/g,'')+'";src:url("'+f.url+'");font-display:swap;}'; });
+  let el=document.getElementById('obFonts'); if(!el){ el=document.createElement('style'); el.id='obFonts'; document.head.appendChild(el); }
+  el.textContent=css;
+}
+async function loadProduction(){
+  if(S._prodLoading) return; S._prodLoading=true;
+  try{ const r=await fetch('/api/production'); if(r.ok){ S.prod=await r.json(); injectFonts(S.prod.fonts); renderApp(); } }
+  catch(e){ toast('couldn’t load fonts/music'); }
+  finally{ S._prodLoading=false; }
+}
+function openStyle(id){
+  const e=S.stories.find(s=>s.id===id); if(!e) return;
+  S.styleStory=id;
+  if(!S.prod) loadProduction();
+  renderApp();
+}
+const CAP_DEF={font:'Liberation Sans',color:'#f2b64a',size:'medium',anim:'sweep',upper:true,pos:55,words:2,bg:0};
+function normCap(c){ c=Object.assign({},CAP_DEF,c||{}); if(typeof c.pos!=='number') c.pos={high:30,mid:55,low:72}[c.pos]||55; if(typeof c.bg!=='number') c.bg=0; return c; }
+function storyCap(e){ return normCap((e.opts&&e.opts.cap)||{}); }
+function globalCap(){ return normCap(((S.settings&&S.settings.render&&S.settings.render.cap))||{}); }
+// The Style controls drive two targets: a per-story override (modal open) OR the
+// global defaults on the Production tab. styleTarget() tells the handlers which.
+function styleTarget(){
+  if(S.styleStory){ const e=S.stories.find(s=>s.id===S.styleStory); return e?{kind:'story',e:e}:null; }
+  return {kind:'global'};   // no modal → editing the Production-tab defaults
+}
+function tgtCap(){ const t=styleTarget(); return t&&t.kind==='story'?storyCap(t.e):globalCap(); }
+function tgtStage(k){ const t=styleTarget(); if(!t) return true; const o=t.kind==='story'?(t.e.opts||{}):((S.settings&&S.settings.render)||{}); return o[k]!==false; }
+function tgtVoice(){ const t=styleTarget(); if(!t) return ''; return (t.kind==='story'?(t.e.opts||{}):((S.settings&&S.settings.render)||{})).voice||''; }
+function tgtTrack(){ const t=styleTarget(); if(!t) return ''; return (t.kind==='story'?(t.e.opts||{}):((S.settings&&S.settings.render)||{})).music_track||''; }
+// auto-save: persist immediately, no re-render churn
+async function saveOptSilent(id,patch){
+  try{ await fetch('/api/story/'+id+'/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'opts',opts:patch})}); }catch(e){}
+}
+// Repaint ONLY the Style editor subtree (not the whole app) — a color/font/size
+// click shouldn't rebuild the sidebar, header and every card. This is the big
+// perf fix for the "frame-laggy" feel while styling.
+function styleCtxNow(){
+  const t=styleTarget();
+  if(t&&t.kind==='story'){ const e=t.e,o=e.opts||{}; return {cap:storyCap(e),capOn:o.captions!==false,musOn:o.music!==false,curVoice:o.voice||'',curTrack:o.music_track||'',toneKey:e.toneKey,tone:e.tone,title:e.title,global:false}; }
+  const rd=(S.settings&&S.settings.render)||{}; return {cap:globalCap(),capOn:rd.captions!==false,musOn:rd.music!==false,curVoice:rd.voice||'',curTrack:rd.music_track||'',toneKey:null,tone:'',title:'',global:true};
+}
+function repaintStyle(){
+  const z=document.getElementById('styleZone');
+  if(!z){ renderApp(); return; }          // editor not mounted → fall back
+  const sc=z.scrollTop;
+  const vl=document.getElementById('voiceList'), vlTop=vl?vl.scrollTop:0;
+  z.innerHTML=styleControls(styleCtxNow());
+  z.scrollTop=sc;
+  // keep the voice list where you scrolled it — picking/previewing a voice must
+  // not jump the list back to the top
+  const vl2=document.getElementById('voiceList'); if(vl2) vl2.scrollTop=vlTop;
+}
+function setCap(patch){
+  const t=styleTarget(); if(!t) return;
+  if(t.kind==='story'){ t.e.opts=Object.assign({},t.e.opts,{cap:Object.assign({},storyCap(t.e),patch)}); repaintStyle(); saveOptSilent(t.e.id,{cap:patch}); }
+  else { S.settings=S.settings||{}; S.settings.render=Object.assign({},S.settings.render,{cap:Object.assign({},globalCap(),patch)}); repaintStyle(); saveSettings({render:{cap:patch}},true); }
+}
+function setStage(patch){
+  const t=styleTarget(); if(!t) return;
+  // stage bools (captions/music/footage) also appear in the top "INCLUDE" box on
+  // the Production tab → those need a full repaint to stay in sync; voice/track
+  // only live in the editor, so a cheap subtree repaint is enough.
+  const heavy=('captions' in patch)||('music' in patch)||('footage' in patch);
+  if(t.kind==='story'){ t.e.opts=Object.assign({},t.e.opts,patch); heavy?renderApp():repaintStyle(); saveOptSilent(t.e.id,patch); }
+  else { S.settings=S.settings||{}; S.settings.render=Object.assign({},S.settings.render,patch); heavy?renderApp():repaintStyle(); saveSettings({render:patch},true); }
+}
+function styleRender(){
+  const e=S.stories.find(s=>s.id===S.styleStory); if(!e) return;
+  stopPreview(); S.styleStory=null;
+  e.status='approved'; e.job={state:'queued',error:null};   // optimistic
+  S.view='queue'; toast('Rendering “'+(e.title||'').slice(0,34)+'”…'); renderApp();
+  act(e.id,'opts',{opts:e.opts||{},render:true});
+}
+let _previewAudio=null;
+function stopPreview(){ try{ if(_previewAudio){ _previewAudio.pause(); _previewAudio.src=''; _previewAudio=null; } }catch(e){} S.playing=null; }
+function togglePreview(key,url,label){
+  // repaintStyle (not renderApp): the ▶/⏸ buttons live inside the Style editor,
+  // so only that subtree repaints — the list keeps its scroll position and you
+  // can see exactly which row you're previewing.
+  if(S.playing===key){ stopPreview(); repaintStyle(); return; }   // ⏸ tap = stop
+  stopPreview();
+  try{
+    _previewAudio=new Audio(url);
+    _previewAudio.onended=()=>{ if(S.playing===key){ S.playing=null; repaintStyle(); } };
+    _previewAudio.onerror=()=>{ if(S.playing===key){ S.playing=null; toast('couldn’t play'); repaintStyle(); } };
+    _previewAudio.play();
+    S.playing=key; repaintStyle();
+  }catch(e){ S.playing=null; toast('couldn’t play sample'); }
+}
+function playVoice(id){
+  const p=S.prod, v=p&&(p.voices||[]).find(x=>x.voice_id===id);
+  if(!v||!v.preview_url){ toast('no sample for this voice'); return; }
+  togglePreview('v:'+id, v.preview_url, v.name.split(' - ')[0]);
+}
+function playMusic(folder,name){ togglePreview('m:'+folder+'/'+name, '/musicfile/'+encodeURIComponent(folder)+'/'+encodeURIComponent(name), name); }
+// optimistic render feedback so a click shows "queued" instantly (no "did it crash?")
+function renderAct(id,action,msg){
+  const e=S.stories.find(s=>s.id===id);
+  if(e) e.job={state:'queued',error:null};
+  toast(msg); renderApp();
+  act(id,action);
+}
+async function uploadMusic(folder,fileInput){
+  const f=fileInput.files&&fileInput.files[0]; if(!f) return;
+  const fd=new FormData(); fd.append('folder',folder); fd.append('file',f);
+  toast('uploading '+f.name+'…');
+  try{ const r=await fetch('/api/music/upload',{method:'POST',body:fd}); const j=await r.json();
+    if(j.ok){ if(S.prod) S.prod.music=j.music; toast(j.msg); renderApp(); } else toast(j.msg||'upload failed'); }
+  catch(e){ toast('upload failed: '+e); }
+}
+async function uploadFont(fileInput){
+  const f=fileInput.files&&fileInput.files[0]; if(!f) return;
+  const fd=new FormData(); fd.append('file',f);
+  toast('uploading '+f.name+'…');
+  try{ const r=await fetch('/api/fonts/upload',{method:'POST',body:fd}); const j=await r.json();
+    if(j.ok){ if(S.prod) S.prod.fonts=j.fonts; setCap({font:j.font}); toast(j.msg); } else toast(j.msg||'upload failed'); }
+  catch(e){ toast('upload failed: '+e); }
+}
+async function generateBatch(){
+  if(S.gen&&S.gen.active) return;
+  const n=S.genCount||3;
+  const body={count:n};
+  if(S.genCats&&S.genCats.length) body.cats=S.genCats;
+  if(S.genTones&&S.genTones.length) body.tones=S.genTones;
+  S.composer=false; S.busyGen=true; renderApp();
+  try{
+    const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!d.ok){ S.busyGen=false; toast(d.msg||'could not start'); }
+    else { S.view='feed'; toast(d.msg); await pollGen(); }
+  }catch(e){ S.busyGen=false; toast('generation failed: '+e); }
+}
+async function regen(id){
+  if(S.gen&&S.gen.active){ toast('already generating — one at a time'); return; }
+  S.openStory=null; renderApp();
+  try{
+    const r=await fetch('/api/story/'+id+'/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'regen'})});
+    const d=await r.json(); toast(d.msg);
+    if(d.ok) await pollGen();
+  }catch(e){ toast('regen failed: '+e); }
+}
+
+// ---- enrich (ported; + shipped status & render/job passthrough) --------------
+function enrich(s){
+  const th=S.threshold??4;
+  const sc=s.scores, ov=overall(sc), mn=Math.min.apply(null,sc), hasSource=!!s.source;
+  const isRec=ov>=th&&mn>=3&&hasSource, round=Math.round(ov);
+  const catColor=CATCOLOR[s.cat]||'#9aa3b2', toneColor=TONECOLOR[s.tone]||'#9aa3b2';
+  let tierLabel,tierColor,tierBg;
+  if(isRec){tierLabel='RECOMMENDED';tierColor='#5fe0a0';tierBg='rgba(52,211,153,.13)';}
+  else if(ov>=3){tierLabel='REVIEW';tierColor='#f2b64a';tierBg='rgba(242,182,74,.12)';}
+  else {tierLabel='PASS';tierColor='#8b93a2';tierBg='rgba(139,147,167,.12)';}
+  const stMap={new:{label:'NEW',color:'#8fbcff',bg:'rgba(110,168,254,.13)'},approved:{label:'GREENLIT',color:'#5fe0a0',bg:'rgba(52,211,153,.13)'},rejected:{label:'PASSED',color:'#e0757a',bg:'rgba(226,90,95,.12)'},shipped:{label:'SHIPPED',color:'#f2b64a',bg:'rgba(242,182,74,.15)'}};
+  const st=stMap[s.status]||stMap.new;
+  const approved=s.status==='approved'||s.status==='shipped', rejected=s.status==='rejected';
+  const beats=(s.script||[]).map((b,i)=>({n:b.n,v:b.v,idx:String(i+1).padStart(2,'0'),chips:(b.k||[]).map(kw=>({kw,url:envatoUrl(kw)})),chosen:(s.clips||[]).find(c=>c.beat_idx===i&&c.url)}));
+  return Object.assign({},s,{
+    overall:ov, overallStr:ov.toFixed(1),
+    starColors:[0,1,2,3,4].map(i=>i<round?'#f2b64a':'#333a49'),
+    catColor, catTint:tint(catColor,0.12), toneColor, tierLabel, tierColor, tierBg,
+    statusLabel:st.label, statusColor:st.color, statusBg:st.bg,
+    breakdown:CRITERIA.map((c,i)=>({label:c.label,score:sc[i],pctStr:(sc[i]/5*100)+'%',color:sc[i]>=4?'#f2b64a':(sc[i]>=3?'#c9a24a':'#6b7280')})),
+    hasSource, stamp:stamp(s.created),
+    feedOpacity:rejected?'0.6':'1',
+    approveLabel:approved?(s.status==='shipped'?'Shipped':'Greenlit'):'Approve',
+    approveShort:approved?(s.status==='shipped'?'Shipped':'Greenlit'):'Approve',
+    approveBg:approved?'linear-gradient(150deg,#f2b64a,#e0a038)':'#12161d',
+    approveFg:approved?'#1a1206':'#5fe0a0', approveBorder:approved?'transparent':'rgba(52,211,153,.3)',
+    rejectBg:rejected?'rgba(226,90,95,.14)':'#12161d', rejectFg:rejected?'#f2777c':'#9aa3b2', rejectBorder:rejected?'rgba(226,90,95,.4)':'#242a35',
+    toneOpen:S.openDropdown===('tone:'+s.id),
+    beats, beatCount:(s.script||[]).length,
+  });
+}
+
+// ---- shared fragments ---------------------------------------------------------
+const MONO="font-family:'IBM Plex Mono',monospace;";
+function stars(e,size){ return '<div style="display:flex;gap:1px;font-size:'+size+'px;line-height:1;">'+e.starColors.map(c=>'<span style="color:'+c+';">★</span>').join('')+'</div>'; }
+function toneMenu(e){
+  if(!e.toneOpen) return '';
+  return '<div style="position:absolute;top:calc(100% + 6px);left:0;z-index:40;min-width:210px;background:#161b23;border:1px solid #2a313d;border-radius:9px;padding:5px;box-shadow:0 14px 38px rgba(0,0,0,.5);animation:obFade .12s ease;">'
+    +TONES.map(t=>{const a=t===e.tone,dot=TONECOLOR[t];return '<button data-act="toneSet:'+e.id+':'+esc(t)+'" class="hvMenu" style="display:flex;align-items:center;gap:9px;width:100%;text-align:left;border:0;cursor:pointer;font-size:12.5px;font-weight:500;color:'+(a?dot:'#dfe3ea')+';background:'+(a?'rgba(255,255,255,.04)':'transparent')+';padding:8px 10px;border-radius:6px;transition:background .1s;"><span style="width:7px;height:7px;border-radius:50%;flex-shrink:0;background:'+dot+';"></span>'+esc(t)+(a?'<span style="margin-left:auto;color:#f2b64a;">✓</span>':'')+'</button>';}).join('')
+    +'</div>';
+}
+function actionBtns(e,ctx){
+  const regenLabel=S.busyRegen[e.id]?'⟳ drafting…':'⟳ Regenerate';
+  return '<button data-act="approve:'+e.id+'" class="hvB2" '+(e.status==='shipped'?'disabled':'')+' style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 13px;border-radius:7px;border:1px solid '+e.approveBorder+';background:'+e.approveBg+';color:'+e.approveFg+';transition:filter .12s;">✓ '+e.approveLabel+'</button>'
+  +'<button data-act="reject:'+e.id+'" class="hvRej" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 13px;border-radius:7px;border:1px solid '+e.rejectBorder+';background:'+e.rejectBg+';color:'+e.rejectFg+';transition:border-color .12s,color .12s;">✕ Pass</button>'
+  +'<button data-act="regen:'+e.id+'" class="hvNeu" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;font-weight:500;padding:7px 13px;border-radius:7px;border:1px solid #242a35;background:#12161d;color:#9aa3b2;transition:border-color .12s,color .12s;">'+regenLabel+'</button>'
+  +'<button data-act="details:'+e.id+'" class="hvNeu" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;font-weight:500;padding:7px 13px;border-radius:7px;border:1px solid #242a35;background:#12161d;color:#9aa3b2;transition:border-color .12s,color .12s;">⤢ Details</button>';
+}
+
+// ---- views ---------------------------------------------------------------------
+// ---- LinkedIn-style split feed: compact list left, full story detail right --------
+function feedCard(e,sel){
+  return '<div data-act="select:'+e.id+'" style="position:relative;display:flex;gap:11px;padding:14px 12px 14px 16px;border-bottom:1px solid #171c25;cursor:pointer;background:'+(sel?'rgba(110,168,254,.07)':'transparent')+';opacity:'+e.feedOpacity+';transition:background .12s;" class="hvNav">'
+    +(sel?'<span style="position:absolute;left:0;top:0;bottom:0;width:3px;background:#8fbcff;"></span>':'')
+    +'<div style="width:44px;height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:center;border-radius:9px;background:'+e.catTint+';color:'+e.catColor+';font-family:\'Spectral\',serif;font-weight:700;font-size:18px;">'+esc(e.cat.charAt(0))+'</div>'
+    +'<div style="flex:1;min-width:0;padding-right:18px;">'
+      +'<div style="font-size:13.5px;font-weight:600;color:'+(sel?'#a9c9ff':'#8fbcff')+';line-height:1.35;">'+esc(e.title)+'</div>'
+      +'<div style="font-size:12px;color:#9aa3b2;margin-top:3px;">'+esc(e.cat)+' · '+esc(e.tone)+'</div>'
+      +'<div style="display:flex;align-items:center;gap:6px;margin-top:5px;font-size:11.5px;color:#7b8291;">'
+        +'<span style="color:#f2b64a;font-weight:600;">★ '+e.overallStr+'</span><span style="color:#3a4453;">·</span>'
+        +'<span style="'+MONO+'font-size:9.5px;font-weight:600;letter-spacing:.05em;color:'+e.statusColor+';">'+e.statusLabel+'</span><span style="color:#3a4453;">·</span>'
+        +'<span>'+esc(e.stamp)+'</span>'
+      +'</div>'
+    +'</div>'
+    +(e.status==='new'?'<button data-act="dismiss:'+e.id+'" class="hvX" title="Pass" style="position:absolute;top:10px;right:9px;cursor:pointer;width:24px;height:24px;display:flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:#5b6270;font-size:14px;transition:background .12s,color .12s;">✕</button>':'')
+  +'</div>';
+}
+
+function feedDetail(e){
+  if(!e) return '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#5b6270;"><div style="text-align:center;"><div style="font-size:34px;margin-bottom:10px;opacity:.5;">◇</div><div style="font-size:15px;color:#8b93a2;">Select a story on the left.</div></div></div>';
+  const match=e.tierLabel==='RECOMMENDED'?['strong','#5fe0a0']:(e.tierLabel==='REVIEW'?['medium','#f2b64a']:['weak','#8b93a2']);
+  const pill=t=>'<span style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:500;color:#dfe3ea;border:1px solid #3a4453;border-radius:20px;padding:6px 13px;">✓ '+t+'</span>';
+  const approved=e.status==='approved'||e.status==='shipped';
+  const bars=e.breakdown.map(b=>'<div><div style="display:flex;justify-content:space-between;font-size:11.5px;margin-bottom:4px;"><span style="color:#a7aebb;">'+b.label+'</span><span style="'+MONO+'font-weight:600;color:'+b.color+';">'+b.score+'</span></div><div style="height:4px;background:#1a1f28;border-radius:3px;overflow:hidden;"><div style="height:100%;width:'+b.pctStr+';background:'+b.color+';border-radius:3px;"></div></div></div>').join('');
+  const scriptHtml=e.beats.length?
+    '<div style="'+MONO+'font-size:10.5px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin:26px 0 12px;">SCRIPT &amp; FOOTAGE · '+e.beatCount+' SHOTS</div>'
+    +e.beats.map(b=>'<div style="display:flex;gap:12px;margin-bottom:13px;">'
+      +'<div style="'+MONO+'font-size:11.5px;font-weight:600;color:#f2b64a;flex-shrink:0;padding-top:1px;width:18px;">'+b.idx+'</div>'
+      +'<div style="flex:1;min-width:0;border-left:1px solid #1e2430;padding-left:13px;">'
+        +'<div style="font-family:\'Spectral\',serif;font-size:15px;line-height:1.5;color:#eae4d6;margin-bottom:7px;">'+esc(b.n)+'</div>'
+        +'<div style="display:flex;flex-wrap:wrap;gap:6px;">'
+        +b.chips.map(c=>'<a href="'+esc(c.url)+'" target="_blank" rel="noopener" class="hvChip" style="display:inline-flex;align-items:center;gap:5px;text-decoration:none;font-size:11.5px;font-weight:500;color:#9fb0ba;background:#0f131a;border:1px solid #233038;border-radius:20px;padding:4px 10px;transition:border-color .12s,color .12s,background .12s;"><span style="color:#4fd1c5;font-size:8px;">▶</span>'+esc(c.kw)+'</a>').join('')
+        +(b.chosen?'<a href="'+esc(b.chosen.url)+'" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:5px;text-decoration:none;font-size:11.5px;font-weight:600;color:#f2b64a;background:rgba(242,182,74,.08);border:1px solid rgba(242,182,74,.35);border-radius:20px;padding:4px 10px;"><span style="font-size:8px;">▶</span>chosen · '+esc(b.chosen.source)+'</a>':'')
+        +'</div></div></div>').join('')
+    :'';
+  return '<div style="max-width:760px;padding:24px 30px 90px;">'
+    // header: who found it (like the company row)
+    +'<div style="display:flex;align-items:center;gap:9px;margin-bottom:14px;">'
+      +'<div style="width:26px;height:26px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:linear-gradient(150deg,#f2b64a,#c8842a);color:#1a1206;border-radius:6px;'+MONO+'font-weight:600;font-size:12px;">'+esc(S.botName.charAt(0))+'</div>'
+      +'<span style="font-size:13px;font-weight:600;color:#e8eaf0;">'+esc(S.botName)+'</span>'
+      +'<span style="'+MONO+'font-size:9px;font-weight:600;letter-spacing:.06em;color:#1a1206;background:#f2b64a;padding:1px 5px;border-radius:3px;">BOT</span>'
+      +'<span style="font-size:12px;color:#5b6270;">found this '+esc(e.stamp)+'</span>'
+    +'</div>'
+    +'<div style="font-family:\'Spectral\',serif;font-size:27px;font-weight:600;line-height:1.22;color:#f6f2ea;letter-spacing:-.015em;margin-bottom:8px;">'+esc(e.title)+'</div>'
+    +'<div style="font-size:13px;color:#8b93a2;margin-bottom:14px;">'+esc(e.cat)+' · '+(e.sources?e.sources.length:0)+' source'+((e.sources||[]).length!==1?'s':'')+' · '+esc(e.stamp)+' · <span style="color:#f2b64a;font-weight:600;">'+e.overallStr+'★</span> weighted</div>'
+    // checkmark pills like ✓ Remote / ✓ Full-time + tone dropdown
+    +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:15px;">'
+      +pill(e.tierLabel.charAt(0)+e.tierLabel.slice(1).toLowerCase())
+      +pill(e.cat)
+      +'<div data-dropdown style="position:relative;">'
+        +'<button data-act="toneToggle:'+e.id+'" class="hvBd" style="display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:12.5px;font-weight:500;color:'+e.toneColor+';background:transparent;border:1px solid #3a4453;border-radius:20px;padding:6px 13px;transition:border-color .12s;"><span style="width:7px;height:7px;border-radius:50%;background:'+e.toneColor+';"></span>'+esc(e.tone)+'<span style="color:#5b6270;font-size:10px;">▾</span></button>'
+        +toneMenu(e)
+      +'</div>'
+    +'</div>'
+    // Apply / Save row
+    +'<div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:20px;">'
+      +'<button data-act="approve:'+e.id+'" class="hvB" '+(e.status==='shipped'?'disabled':'')+' style="cursor:pointer;font-size:14px;font-weight:600;padding:9px 22px;border-radius:20px;border:0;background:'+(approved?'rgba(52,211,153,.15)':'linear-gradient(150deg,#f2b64a,#e0a038)')+';color:'+(approved?'#5fe0a0':'#1a1206')+';">'+(approved?'✓ '+e.approveLabel:'Approve ↗')+'</button>'
+      +'<button data-act="reject:'+e.id+'" class="hvRej" style="cursor:pointer;font-size:14px;font-weight:600;padding:8px 20px;border-radius:20px;border:1px solid '+(e.status==='rejected'?'rgba(226,90,95,.5)':'#3a4453')+';background:transparent;color:'+(e.status==='rejected'?'#f2777c':'#dfe3ea')+';transition:border-color .12s,color .12s;">'+(e.status==='rejected'?'Passed':'Pass')+'</button>'
+      +'<button data-act="regen:'+e.id+'" class="hvNeu" style="cursor:pointer;font-size:14px;font-weight:500;padding:8px 20px;border-radius:20px;border:1px solid #3a4453;background:transparent;color:#9aa3b2;transition:border-color .12s,color .12s;">⟳ Regenerate</button>'
+    +'</div>'
+    // SCOUT rating panel (the "Premium job match" card)
+    +'<div style="background:#12161d;border:1px solid #262d38;border-radius:12px;padding:16px 19px;margin-bottom:22px;">'
+      +'<div style="display:flex;align-items:center;gap:7px;margin-bottom:6px;"><span style="color:#f2b64a;font-size:13px;">◆</span><span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.12em;color:#f2b64a;">'+esc(S.botName.toUpperCase())+' RATING</span></div>'
+      +'<div style="font-size:16.5px;font-weight:600;color:#e8eaf0;margin-bottom:3px;">Story match is <span style="color:'+match[1]+';">'+match[0]+'</span> — '+e.overallStr+' / 5.0 weighted'+'</div>'
+      +'<div style="font-size:12.5px;color:#8b93a2;margin-bottom:14px;">Scored on the eight rubric criteria; hooks and virality count most.</div>'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:9px 22px;">'+bars+'</div>'
+    +'</div>'
+    +(approved?renderBlock(e):'')
+    // About the story
+    +'<div style="'+MONO+'font-size:10.5px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin:'+(approved?'22px':'0')+' 0 10px;">ABOUT THIS STORY</div>'
+    +'<div style="font-family:\'Spectral\',serif;font-style:italic;font-size:16.5px;line-height:1.5;color:#e6d9c1;border-left:2px solid #f2b64a;padding-left:14px;margin-bottom:13px;">“'+esc(e.hook)+'”</div>'
+    +'<div style="font-size:14.5px;line-height:1.65;color:#b9c0cd;">'+esc(e.summary)+'</div>'
+    +((e.yt||[]).length?'<div style="'+MONO+'font-size:10.5px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin:22px 0 8px;">SUGGESTED YOUTUBE TITLES</div>'
+      +(e.yt||[]).map(y=>'<div style="display:flex;gap:9px;font-size:14px;color:#dfe3ea;line-height:1.5;padding:7px 0;border-bottom:1px solid #171c25;"><span style="color:'+e.catColor+';flex-shrink:0;">▸</span><span>'+esc(y)+'</span></div>').join(''):'')
+    +(e.hasSource?'<div style="margin-top:18px;display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:#8b93a2;background:#0f131a;border:1px solid #1c212b;border-radius:8px;padding:10px 13px;"><span style="'+MONO+'font-size:9.5px;font-weight:600;letter-spacing:.06em;color:#5eead4;background:rgba(94,234,212,.1);padding:2px 6px;border-radius:4px;flex-shrink:0;margin-top:1px;">TRUE STORY</span><span style="line-height:1.5;word-break:break-all;">'+e.sources.map(u=>'<a href="'+esc(u)+'" target="_blank" rel="noopener">'+esc(u)+'</a>').join('<br>')+'</span></div>':'')
+    +scriptHtml
+  +'</div>';
+}
+
+function feedView(list){
+  const total=list.length;
+  // ---- filter + sort ----
+  let items=list.slice();
+  if(S.feedStatus!=='all') items=items.filter(e=>S.feedStatus==='approved'?(e.status==='approved'||e.status==='shipped'):e.status===S.feedStatus);
+  if(S.feedCat!=='all') items=items.filter(e=>e.catKey===S.feedCat);
+  if(S.feedTone!=='all') items=items.filter(e=>e.toneKey===S.feedTone);
+  items.sort((a,b)=>S.feedSort==='oldest'?a.created-b.created:S.feedSort==='score'?(b.overall-a.overall)||(b.created-a.created):S.feedSort==='az'?(a.title||'').localeCompare(b.title||''):b.created-a.created);
+  const sel=items.find(x=>x.id===S.selStory)||items[0]||null;
+  if(sel&&sel.id!==S.selStory) S.selStory=sel.id;
+  // ---- filter bar ----
+  const SORTS={newest:'Newest',score:'Highest rated',oldest:'Oldest',az:'A–Z'};
+  const sortOpts=Object.keys(SORTS).map(k=>({value:k,label:SORTS[k],active:S.feedSort===k}));
+  const catOpts=[{value:'all',label:'All categories',active:S.feedCat==='all'}].concat((S.catCatalog||[]).map(c=>({value:c.key,label:c.label,active:S.feedCat===c.key})));
+  const toneOpts=[{value:'all',label:'All tones',active:S.feedTone==='all'}].concat((S.tonesApi||[]).map(t=>({value:t.key,label:t.label,active:S.feedTone===t.key})));
+  const catLabel=S.feedCat==='all'?'All':((S.catCatalog||[]).find(c=>c.key===S.feedCat)||{}).label||'All';
+  const toneLabel=S.feedTone==='all'?'All':(((S.tonesApi||[]).find(t=>t.key===S.feedTone)||{}).label||'All').split(' /')[0];
+  const dd=(key,tag,cur,opts,active)=>'<div data-dropdown style="position:relative;">'
+    +'<button data-act="ddToggle:'+key+'" class="hvBd" style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;font-weight:500;background:'+(active?'rgba(242,182,74,.08)':'#12161d')+';border:1px solid '+(active?'rgba(242,182,74,.3)':'#232a35')+';border-radius:8px;padding:6px 10px;color:#dfe3ea;"><span style="'+MONO+'font-size:9px;color:#6b7280;letter-spacing:.05em;">'+tag+'</span><span style="color:'+(active?'#f2b64a':'#dfe3ea')+';font-weight:600;">'+esc(cur)+'</span><span style="color:#5b6270;font-size:9px;">▾</span></button>'
+    +(S.openDropdown===key?ddMenu(opts,'ddSet:'+key):'')+'</div>';
+  const stChip=(v,label)=>'<button data-act="feedStatus:'+v+'" style="cursor:pointer;font-size:11.5px;font-weight:500;padding:5px 11px;border-radius:20px;border:1px solid '+(S.feedStatus===v?'rgba(242,182,74,.4)':'#242a35')+';background:'+(S.feedStatus===v?'rgba(242,182,74,.12)':'#12161d')+';color:'+(S.feedStatus===v?'#f2b64a':'#9aa3b2')+';">'+label+'</button>';
+  const anyFilter=S.feedStatus!=='all'||S.feedCat!=='all'||S.feedTone!=='all'||S.feedSort!=='newest';
+  const bar='<div style="padding:14px 16px 12px;border-bottom:1px solid #171c25;">'
+    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;"><div style="font-size:15px;font-weight:600;color:#f4f6fa;">Story feed</div><div style="'+MONO+'font-size:11px;color:#6b7280;margin-left:auto;">'+items.length+(items.length!==total?' of '+total:'')+'</div></div>'
+    +'<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">'+dd('feedSort','SORT',SORTS[S.feedSort],sortOpts,S.feedSort!=='newest')+dd('feedCat','CAT',catLabel,catOpts,S.feedCat!=='all')+dd('feedTone','TONE',toneLabel,toneOpts,S.feedTone!=='all')+'</div>'
+    +'<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">'+stChip('all','All')+stChip('new','New')+stChip('approved','Greenlit')+stChip('rejected','Passed')+(anyFilter?'<button data-act="feedClear" class="hvGold" style="margin-left:auto;cursor:pointer;font-size:11px;color:#7b8291;background:none;border:0;text-decoration:underline;text-underline-offset:2px;">reset</button>':'')+'</div>'
+  +'</div>';
+  const listInner=items.length?items.map(e=>feedCard(e,sel&&e.id===sel.id)).join(''):'<div style="padding:50px 20px;text-align:center;color:#5b6270;font-size:13px;">No stories match.<br><button data-act="feedClear" style="margin-top:12px;cursor:pointer;font-size:12px;font-weight:600;color:#f2b64a;background:rgba(242,182,74,.1);border:1px solid rgba(242,182,74,.25);border-radius:8px;padding:7px 14px;">Clear filters</button></div>';
+  if(!total) return '<div style="flex:1;display:flex;align-items:center;justify-content:center;color:#5b6270;"><div style="text-align:center;"><div style="font-size:34px;margin-bottom:10px;opacity:.5;">◇</div><div style="font-size:15px;color:#8b93a2;">No drafts yet — hit ⟳ Generate stories.</div></div></div>';
+  return '<div style="flex:1;min-height:0;display:flex;overflow:hidden;">'
+    +'<div id="feedList" style="width:390px;flex-shrink:0;overflow-y:auto;border-right:1px solid #1a1f28;background:#0e1116;">'+bar+listInner+'</div>'
+    +'<div id="feedDetail" style="flex:1;min-width:0;overflow-y:auto;">'+feedDetail(sel)+'</div>'
+  +'</div>';
+}
+
+function ddMenu(options,actPrefix,alignRight){
+  return '<div style="position:absolute;top:calc(100% + 6px);'+(alignRight?'right':'left')+':0;z-index:40;min-width:200px;max-height:320px;overflow-y:auto;background:#161b23;border:1px solid #2a313d;border-radius:10px;padding:5px;box-shadow:0 16px 40px rgba(0,0,0,.55);animation:obFade .12s ease;">'
+    +options.map(o=>'<button data-act="'+actPrefix+':'+esc(o.value)+'" class="hvMenu" style="display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;cursor:pointer;font-size:13px;font-weight:500;color:'+(o.active?'#f2b64a':'#dfe3ea')+';background:'+(o.active?'rgba(242,182,74,.07)':'transparent')+';padding:8px 10px;border-radius:6px;transition:background .1s;">'+esc(o.label)+(o.active?'<span style="margin-left:auto;color:#f2b64a;">✓</span>':'')+'</button>').join('')+'</div>';
+}
+
+function dashboardView(enriched){
+  let dash=enriched.slice();
+  if(S.filterRating!=='all') dash=dash.filter(e=>S.filterRating==='4plus'?e.overall>=4:S.filterRating==='3plus'?e.overall>=3:e.overall<3);
+  if(S.filterStatus!=='all') dash=dash.filter(e=>e.status===S.filterStatus);
+  if(S.filterCategory!=='all') dash=dash.filter(e=>e.cat===S.filterCategory);
+  if(S.filterTone!=='all') dash=dash.filter(e=>e.tone===S.filterTone);
+  if(S.search.trim()){const q=S.search.trim().toLowerCase();dash=dash.filter(e=>(e.title+' '+e.summary+' '+e.cat).toLowerCase().includes(q));}
+  dash.sort((a,b)=>S.sortBy==='title'?(a.title||'').localeCompare(b.title||''):S.sortBy==='newest'?b.created-a.created:b.overall-a.overall);
+  const defs=[
+    {key:'filterRating',label:'RATING',options:[{value:'all',label:'All'},{value:'4plus',label:'4★ & up'},{value:'3plus',label:'3★ & up'},{value:'under3',label:'Under 3★'}]},
+    {key:'filterStatus',label:'STATUS',options:[{value:'all',label:'All'},{value:'new',label:'New'},{value:'approved',label:'Greenlit'},{value:'rejected',label:'Passed'},{value:'shipped',label:'Shipped'}]},
+    {key:'filterCategory',label:'CATEGORY',options:[{value:'all',label:'All'}].concat(CATS.map(c=>({value:c,label:c})))},
+    {key:'filterTone',label:'TONE',options:[{value:'all',label:'All'}].concat(TONES.map(t=>({value:t,label:t})))},
+  ];
+  const chips=defs.map(f=>{
+    const val=S[f.key], cur=f.options.find(o=>o.value===val)||f.options[0], active=val!==f.options[0].value;
+    const opts=f.options.map(o=>({value:o.value,label:o.label,active:o.value===val}));
+    return '<div data-dropdown style="position:relative;">'
+      +'<button data-act="ddToggle:'+f.key+'" class="hvBd" style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:13px;font-weight:500;color:#dfe3ea;background:'+(active?'rgba(242,182,74,.08)':'#12161d')+';border:1px solid '+(active?'rgba(242,182,74,.3)':'#232a35')+';border-radius:9px;padding:9px 13px;transition:border-color .12s;">'
+      +'<span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.08em;color:#6b7280;">'+f.label+'</span>'
+      +'<span style="color:'+(active?'#f2b64a':'#dfe3ea')+';font-weight:600;">'+esc(cur.label)+'</span><span style="color:#5b6270;font-size:10px;">▾</span></button>'
+      +(S.openDropdown===f.key?ddMenu(opts,'ddSet:'+f.key):'')+'</div>';
+  }).join('');
+  const sortLabels={score:'Highest score',newest:'Newest',title:'A–Z'};
+  const sortOpts=[{value:'score',label:'Highest score'},{value:'newest',label:'Newest'},{value:'title',label:'A–Z'}].map(o=>({value:o.value,label:o.label,active:o.value===S.sortBy}));
+  const sortDD='<div data-dropdown style="position:relative;margin-left:auto;">'
+    +'<button data-act="ddToggle:sortBy" class="hvBd" style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:13px;font-weight:500;color:#dfe3ea;background:#12161d;border:1px solid #232a35;border-radius:9px;padding:9px 13px;transition:border-color .12s;"><span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.08em;color:#6b7280;">SORT</span><span style="color:#dfe3ea;font-weight:600;">'+sortLabels[S.sortBy]+'</span><span style="color:#5b6270;font-size:10px;">▾</span></button>'
+    +(S.openDropdown==='sortBy'?ddMenu(sortOpts,'ddSet:sortBy',true):'')+'</div>';
+  const anyFilter=S.filterRating!=='all'||S.filterStatus!=='all'||S.filterCategory!=='all'||S.filterTone!=='all'||!!S.search.trim();
+  const grid=dash.map(e=>
+    '<div style="display:flex;flex-direction:column;background:#13171e;border:1px solid #1f2530;border-top:3px solid '+e.catColor+';border-radius:5px 5px 11px 11px;padding:15px 16px;animation:obFade .2s ease both;">'
+    +'<div style="display:flex;align-items:center;gap:7px;margin-bottom:10px;"><span style="'+MONO+'font-size:10px;font-weight:600;color:'+e.catColor+';background:'+e.catTint+';padding:3px 8px;border-radius:5px;">'+esc(e.cat)+'</span><span style="margin-left:auto;'+MONO+'font-size:9.5px;font-weight:600;letter-spacing:.05em;color:'+e.statusColor+';background:'+e.statusBg+';padding:3px 8px;border-radius:5px;">'+e.statusLabel+'</span></div>'
+    +'<div data-act="details:'+e.id+'" class="hvW" style="font-family:\'Spectral\',serif;font-size:18px;font-weight:600;line-height:1.26;color:#f6f2ea;cursor:pointer;margin-bottom:9px;letter-spacing:-.01em;transition:color .12s;">'+esc(e.title)+'</div>'
+    +'<div style="display:flex;align-items:center;gap:9px;margin-bottom:10px;">'+stars(e,13)+'<span style="'+MONO+'font-size:12px;color:#f2b64a;font-weight:600;">'+e.overallStr+'</span><span style="margin-left:auto;'+MONO+'font-size:9.5px;font-weight:600;letter-spacing:.05em;color:'+e.tierColor+';background:'+e.tierBg+';padding:2px 7px;border-radius:5px;">'+e.tierLabel+'</span></div>'
+    +'<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;font-size:12px;color:'+e.toneColor+';"><span style="width:6px;height:6px;border-radius:50%;background:'+e.toneColor+';"></span>'+esc(e.tone)+'</div>'
+    +'<div style="font-size:13px;line-height:1.55;color:#9aa3b2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:14px;">'+esc(e.summary)+'</div>'
+    +'<div style="margin-top:auto;display:flex;gap:7px;border-top:1px solid #1c212b;padding-top:12px;">'
+      +'<button data-act="approve:'+e.id+'" class="hvB2" '+(e.status==='shipped'?'disabled':'')+' style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;cursor:pointer;font-size:12px;font-weight:600;padding:7px;border-radius:7px;border:1px solid '+e.approveBorder+';background:'+e.approveBg+';color:'+e.approveFg+';transition:filter .12s;">✓ '+e.approveShort+'</button>'
+      +'<button data-act="reject:'+e.id+'" class="hvRej" style="cursor:pointer;font-size:12px;font-weight:600;padding:7px 12px;border-radius:7px;border:1px solid '+e.rejectBorder+';background:'+e.rejectBg+';color:'+e.rejectFg+';transition:border-color .12s,color .12s;">✕</button>'
+      +'<button data-act="details:'+e.id+'" class="hvNeu" style="cursor:pointer;font-size:12px;font-weight:500;padding:7px 12px;border-radius:7px;border:1px solid #242a35;background:#12161d;color:#9aa3b2;transition:border-color .12s,color .12s;">⤢</button>'
+    +'</div></div>').join('');
+  return '<div style="padding:20px 24px 80px;">'
+    +'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;">'+chips+sortDD+'</div>'
+    +'<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;"><div style="'+MONO+'font-size:12px;color:#7b8291;">'+dash.length+' of '+enriched.length+' stories</div>'
+    +(anyFilter?'<button data-act="clear" class="hvGold" style="cursor:pointer;font-size:12px;color:#7b8291;background:none;border:0;text-decoration:underline;text-underline-offset:2px;transition:color .12s;">clear filters</button>':'')+'</div>'
+    +(dash.length===0?'<div style="text-align:center;padding:70px 20px;color:#5b6270;"><div style="font-size:34px;margin-bottom:10px;opacity:.5;">⌕</div><div style="font-size:15px;color:#8b93a2;">No stories match these filters.</div><button data-act="clear" style="margin-top:14px;cursor:pointer;font-size:13px;font-weight:600;color:#f2b64a;background:rgba(242,182,74,.1);border:1px solid rgba(242,182,74,.25);border-radius:8px;padding:8px 16px;">Clear filters</button></div>':'')
+    +'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;">'+grid+'</div></div>';
+}
+
+// ---- live generation panel (loading bar + count) ---------------------------------
+function genPanel(){
+  const g=S.gen; if(!g||!g.active) return '';
+  const phases=[['research','Research'],['judge','Judge'],['write','Write']];
+  let cur=phases.findIndex(p=>p[0]===g.phase); if(cur<0) cur=0;
+  const determinate=g.phase==='write'&&g.total>0;
+  const pct=determinate?Math.min(100,Math.round(g.done/g.total*100)):0;
+  const title=g.kind==='regen'?'Drafting a new angle':(g.kind==='auto'?('Auto-generating '+g.total+' stor'+(g.total!==1?'ies':'y')):('Generating '+g.total+' stor'+(g.total!==1?'ies':'y')));
+  const bar=determinate
+    ? '<div style="height:100%;width:'+pct+'%;background:linear-gradient(90deg,#f2b64a,#e0a038);border-radius:6px;transition:width .5s ease;position:relative;overflow:hidden;"><span class="obShine"></span></div>'
+    : '<div class="obIndet" style="height:100%;width:38%;background:linear-gradient(90deg,transparent,#f2b64a,transparent);border-radius:6px;"></div>';
+  const steps=phases.map((p,i)=>{
+    const done=i<cur, on=i===cur;
+    const col=on?'#f2b64a':(done?'#5fe0a0':'#3a4453');
+    return '<span style="display:flex;align-items:center;gap:6px;'+MONO+'font-size:11px;color:'+col+';"><span style="width:8px;height:8px;border-radius:50%;background:'+col+';'+(on?'animation:obPulse 1s ease-in-out infinite;':'')+'"></span>'+p[1]+(done?' ✓':'')+'</span>';
+  }).join('<span style="flex:1;height:1px;background:#232a35;min-width:10px;"></span>');
+  // floating card (bottom-right) — overlays instead of pushing the feed down
+  return '<div style="position:fixed;right:22px;bottom:24px;z-index:90;width:min(390px,calc(100vw - 44px));animation:obUp .25s ease both;"><div style="background:#12161d;border:1px solid rgba(242,182,74,.35);border-radius:12px;padding:16px 18px;box-shadow:0 18px 48px rgba(0,0,0,.55);">'
+    +'<div style="display:flex;align-items:center;gap:12px;margin-bottom:13px;">'
+      +'<span style="width:28px;height:28px;flex-shrink:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:linear-gradient(150deg,#f2b64a,#c8842a);color:#1a1206;font-size:15px;font-weight:700;"><span class="obSpin">◠</span></span>'
+      +'<div style="flex:1;min-width:0;"><div style="font-size:14.5px;font-weight:600;color:#f4f6fa;">'+esc(title)+'</div>'
+        +'<div style="font-size:12.5px;color:#9aa3b2;margin-top:1px;">'+esc(g.label||'working…')+'</div></div>'
+      +(determinate?'<div style="'+MONO+'font-size:17px;font-weight:600;color:#f2b64a;">'+g.done+'<span style="color:#5b6270;font-size:13px;">/'+g.total+'</span></div>':'<div style="'+MONO+'font-size:11px;color:#7b8291;letter-spacing:.1em;">WORKING</div>')
+    +'</div>'
+    +'<div style="height:9px;background:#0b0d10;border-radius:6px;overflow:hidden;margin-bottom:12px;">'+bar+'</div>'
+    +'<div style="display:flex;align-items:center;gap:10px;">'+steps+'</div>'
+  +'</div></div>';
+}
+
+// mini stage tracker for an in-flight render (Narration→Footage→Cutting→Preview)
+function renderStages(state){
+  const cur=RENDER_ORDER.indexOf(state);
+  return RENDER_STAGES.map(s=>{
+    const si=RENDER_ORDER.indexOf(s[0]), done=si<cur, on=si===cur;
+    const col=on?'#f2b64a':(done?'#5fe0a0':'#3a4453');
+    return '<span style="display:flex;align-items:center;gap:5px;'+MONO+'font-size:10px;color:'+col+';"><span style="width:7px;height:7px;border-radius:50%;background:'+col+';'+(on?'animation:obPulse 1s ease-in-out infinite;':'')+'"></span>'+s[1]+'</span>';
+  }).join('<span style="flex:1;height:1px;background:#222834;min-width:8px;"></span>');
+}
+
+// the real-pipeline extension of the queue row: render state + player + controls
+function renderBlock(e){
+  const job=e.job, ri=e.render||{};
+  let chip='', line='', extras=[];
+  let progressHtml='';
+  if(job&&JOBSTATE[job.state]){
+    const j=JOBSTATE[job.state];
+    const active=(job.state!=='blocked'&&job.state!=='failed');
+    const pulse=active?'animation:obPulse 2s ease-in-out infinite;':'';
+    chip='<span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.06em;color:'+j.color+';background:'+j.bg+';padding:3px 9px;border-radius:5px;'+pulse+'">'+j.label+'</span>';
+    line=active?'<span style="font-size:12.5px;color:#8b93a2;">'+j.line+'</span>':'<span style="font-size:12.5px;color:#f2777c;line-height:1.5;">'+esc(job.error||'')+'</span>';
+    if(active){
+      const pct=j.pct||10;
+      progressHtml='<div style="margin-top:11px;height:8px;background:#0b0d10;border-radius:6px;overflow:hidden;"><div style="height:100%;width:'+pct+'%;background:linear-gradient(90deg,#f2b64a,#e0a038);border-radius:6px;transition:width .6s ease;position:relative;overflow:hidden;"><span class="obShine"></span></div></div>'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-top:9px;">'+renderStages(job.state)+'</div>';
+    }
+    if(!active) extras.push('<button data-act="renderNow:'+e.id+'" class="hvB" style="cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:7px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">🎥 Retry render</button>');
+  } else if(ri.master){
+    chip='<span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.06em;color:#5fe0a0;background:rgba(52,211,153,.13);padding:3px 9px;border-radius:5px;">RENDERED · 1080×1920</span>';
+    line='<span style="font-size:12.5px;color:#8b93a2;">'+(ri.duration?fmtDur(ri.duration)+' · ':'')+'full-res 1080×1920 · 60fps — download below</span>';
+    // full-res 1080x1920 MP4 download (the on-page player is a smaller preview)
+    if(ri.master_url) extras.push('<a href="'+ri.master_url+'" download="story-'+e.id+'-1080x1920.mp4" class="hvB" style="display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;font-weight:700;padding:7px 15px;border-radius:7px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">⬇ Download 1080×1920 MP4</a>');
+    if(ri.alpha) extras.push('<a href="'+ri.alpha+'" download="story-'+e.id+'-1080x1920-alpha.mov" class="hvBrief" style="display:inline-flex;align-items:center;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:7px;border:1px solid rgba(94,234,212,.35);background:rgba(94,234,212,.08);color:#5eead4;">⬇ Transparent .mov (1080×1920)</a>');
+    if(e.status!=='shipped') extras.push('<button data-act="ship:'+e.id+'" class="hvB" style="cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:7px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">🚢 Ship it</button>');
+    extras.push('<button data-act="reroll:'+e.id+'" class="hvNeu" style="cursor:pointer;font-size:12.5px;font-weight:500;padding:7px 14px;border-radius:7px;border:1px solid #242a35;background:#12161d;color:#9aa3b2;">🎲 Re-roll clips</button>');
+    extras.push('<button data-act="revoice:'+e.id+'" class="hvNeu" style="cursor:pointer;font-size:12.5px;font-weight:500;padding:7px 14px;border-radius:7px;border:1px solid #242a35;background:#12161d;color:#9aa3b2;">🎙 Change voice</button>');
+    extras.push('<a href="/api/story/'+e.id+'/credits" target="_blank" class="hvBrief" style="display:inline-flex;align-items:center;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:7px;border:1px solid #2a313d;background:#181d26;color:#dfe3ea;">⬇ credits.txt</a>');
+  } else {
+    chip='<span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.06em;color:#8b93a2;background:rgba(139,147,167,.12);padding:3px 9px;border-radius:5px;">NOT RENDERED</span>';
+    line='<span style="font-size:12.5px;color:#8b93a2;">approve queues it — here’s the pipeline it’ll run:</span>';
+    // always-visible (greyed) pipeline tracker so you can see what's coming
+    progressHtml='<div style="display:flex;align-items:center;gap:8px;margin-top:11px;opacity:.75;">'+renderStages('')+'</div>';
+    extras.push('<button data-act="renderNow:'+e.id+'" class="hvB" style="cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:7px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">🎥 Render now</button>');
+  }
+  // per-story production toggles (only while greenlit, not shipped)
+  let optsRow='';
+  if(e.opts && e.status==='approved'){
+    const pill=(key,label)=>{const on=e.opts[key]!==false;return '<button data-act="opt:'+e.id+':'+key+'" style="cursor:pointer;font-size:11.5px;font-weight:500;padding:5px 11px;border-radius:20px;border:1px solid '+(on?'rgba(95,224,160,.4)':'#242a35')+';background:'+(on?'rgba(52,211,153,.12)':'#12161d')+';color:'+(on?'#5fe0a0':'#6b7280')+';transition:all .12s;">'+(on?'✓ ':'○ ')+label+'</button>';};
+    optsRow='<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:11px;"><span style="'+MONO+'font-size:9px;letter-spacing:.1em;color:#6b7280;margin-right:2px;">INCLUDE</span>'+pill('footage','Footage')+pill('music','Music')+pill('captions','Captions')
+      +'<button data-act="style:'+e.id+'" class="hvB" title="Change captions, font, colour, voice &amp; music for this story" style="margin-left:auto;cursor:pointer;font-size:12px;font-weight:700;padding:7px 15px;border-radius:20px;border:1px solid rgba(242,182,74,.55);background:rgba(242,182,74,.13);color:#f2b64a;transition:all .12s;">🎨 Change style →</button></div>';
+  }
+  const player=ri.preview?'<video controls preload="none" src="'+ri.preview+'" style="width:100%;max-height:400px;background:#000;border-radius:10px;margin-top:11px;border:1px solid #1c212b;"></video>'
+    +'<div style="'+MONO+'font-size:9.5px;color:#565d6b;margin-top:5px;text-align:center;">▲ preview proxy for fast playback — use <span style="color:#f2b64a;">⬇ Download 1080×1920 MP4</span> for the full-res file</div>':'';
+  return '<div style="margin-top:14px;background:#0f131a;border:1px solid #1c212b;border-radius:10px;padding:12px 14px;">'
+    +optsRow
+    +'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'+chip+line+'<span style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;">'+extras.join('')+'</span></div>'
+    +progressHtml+player+'</div>';
+}
+
+// ---- costs & credits view ----------------------------------------------------------
+function usd(n){ return '$'+(n||0).toFixed(2); }
+function fmtN(n){ return (n||0).toLocaleString(); }
+function costsView(){
+  const c=S.costs;
+  if(!c) return '<div style="max-width:820px;margin:0 auto;padding:60px 24px;text-align:center;color:#8b93a2;'+MONO+'">loading spend…</div>';
+  const a=c.anthropic, el=c.eleven, rn=c.renders, px=c.pexels, dy=c.daily;
+  const card=(inner,accent)=>'<div style="background:#13171e;border:1px solid '+(accent||'#1f2530')+';border-radius:13px;padding:18px 20px;">'+inner+'</div>';
+  const lbl=t=>'<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.14em;color:#6b7280;margin-bottom:10px;">'+t+'</div>';
+  // ElevenLabs
+  let elBody;
+  if(el&&el.ok&&el.limit){
+    const left=el.limit-el.used, pctUsed=Math.min(100,Math.round(el.used/el.limit*100));
+    const low=left<3000;
+    const resetTxt=el.reset?('resets '+new Date(el.reset*1000).toLocaleDateString(undefined,{month:'short',day:'numeric'})):'monthly reset';
+    elBody=lbl('ELEVENLABS · NARRATION CREDITS')
+      +'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;"><span style="font-family:\'Spectral\',serif;font-size:34px;font-weight:700;color:'+(low?'#f2777c':'#5fe0a0')+';line-height:1;">'+fmtN(left)+'</span><span style="font-size:13px;color:#8b93a2;">left of '+fmtN(el.limit)+'</span></div>'
+      +'<div style="height:8px;background:#0b0d10;border-radius:6px;overflow:hidden;margin:10px 0 8px;"><div style="height:100%;width:'+pctUsed+'%;background:'+(low?'#e0757a':'linear-gradient(90deg,#f2b64a,#e0a038)')+';border-radius:6px;"></div></div>'
+      +'<div style="display:flex;justify-content:space-between;font-size:12px;color:#8b93a2;"><span>'+fmtN(el.used)+' used'+(el.tier?' · '+esc(el.tier):'')+'</span><span style="color:'+(low?'#f2777c':'#8b93a2')+';">'+resetTxt+'</span></div>'
+      +(low?'<div style="margin-top:11px;font-size:12.5px;color:#f2b64a;background:rgba(242,182,74,.1);border:1px solid rgba(242,182,74,.25);border-radius:8px;padding:9px 12px;">⚠ Low — a ~60s Short needs ~1,100 credits. Top up or wait for the reset.</div>':'');
+  } else {
+    elBody=lbl('ELEVENLABS · NARRATION CREDITS')+'<div style="font-size:13.5px;color:#9aa3b2;line-height:1.5;">Credit read unavailable — the API key is scoped TTS-only. Renders still work; the pre-flight quota guard is off. Re-scope the key with <span style="'+MONO+'">user_read</span> to see the balance + reset here.</div>';
+  }
+  // Anthropic estimated spend
+  const anBody=lbl('ANTHROPIC · '+esc(a && c.month||'')+' (ESTIMATE)')
+    +'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:12px;"><span style="font-family:\'Spectral\',serif;font-size:34px;font-weight:700;color:#f2b64a;line-height:1;">'+usd(a.estUsd)+'</span><span style="font-size:13px;color:#8b93a2;">this month</span></div>'
+    +'<div style="display:grid;grid-template-columns:1fr auto;gap:6px 14px;font-size:12.5px;color:#a7aebb;">'
+      +'<span>Story model in / out</span><span style="'+MONO+'color:#cfd4de;">'+fmtN(a.inMain)+' / '+fmtN(a.outMain)+'</span>'
+      +'<span>Helper model in / out</span><span style="'+MONO+'color:#cfd4de;">'+fmtN(a.inFast)+' / '+fmtN(a.outFast)+'</span>'
+      +'<span>Web searches</span><span style="'+MONO+'color:#cfd4de;">'+fmtN(a.searches)+'</span>'
+    +'</div>'
+    +'<div style="margin-top:11px;font-size:11.5px;color:#6b7280;line-height:1.5;">Est. at $'+a.priceInMain+'/$'+a.priceOutMain+' per 1M story-model tokens + $'+a.priceSearch+'/1k searches. Anthropic bills usage — no prepaid balance to refresh; this tracks spend. Tune rates with STORY_PRICE_* envs.</div>';
+  // budgets row
+  const budget=(name,used,cap,unit,color)=>{const pct=cap?Math.min(100,Math.round(used/cap*100)):0;return '<div style="flex:1;min-width:150px;">'
+    +'<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;"><span style="color:#a7aebb;">'+name+'</span><span style="'+MONO+'font-weight:600;color:'+color+';">'+used+'<span style="color:#5b6270;">/'+(cap||'∞')+'</span> '+unit+'</span></div>'
+    +'<div style="height:6px;background:#0b0d10;border-radius:4px;overflow:hidden;"><div style="height:100%;width:'+pct+'%;background:'+color+';border-radius:4px;"></div></div></div>';};
+  const budgetsBody=lbl('TODAY · GUARDRAILS')
+    +'<div style="display:flex;gap:20px;flex-wrap:wrap;">'
+      +budget('Drafts generated',dy.made,dy.target,'',dy.made>=dy.target?'#5fe0a0':'#8fbcff')
+      +budget('Renders',rn.today,rn.cap,'',(rn.cap&&rn.today>=rn.cap)?'#f2777c':'#5fe0a0')
+      +budget('Pexels calls (hr)',px.hour,px.cap,'',px.hour>=px.cap?'#f2777c':'#4fd1c5')
+    +'</div>'
+    +'<div style="margin-top:12px;font-size:12px;color:#8b93a2;">Auto-generation is '+(dy.autogen?'<strong style="color:#5fe0a0;">on</strong> — '+(dy.target?('~'+dy.target+' drafts/day'):'unlimited')+' in batches of '+dy.batch:'<strong style="color:#8b93a2;">off</strong>')+'. Drafts are Anthropic-only; rendering '+(rn.cap?('is capped at '+rn.cap+'/day and '):'')+'only runs on stories you approve.</div>';
+  return '<div style="max-width:900px;margin:0 auto;padding:26px 24px 80px;">'
+    +'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-bottom:16px;">'
+      +card(elBody,(el&&el.ok&&el.limit&&(el.limit-el.used)<3000)?'rgba(226,90,95,.4)':'#1f2530')
+      +card(anBody)
+    +'</div>'
+    +card(budgetsBody)
+    +'</div>';
+}
+
+function queueView(enriched){
+  const list=enriched.filter(e=>e.status==='approved'||e.status==='shipped')
+    .sort((a,b)=>(a.status===b.status)?b.overall-a.overall:(a.status==='approved'?-1:1))
+    .map((e,i)=>Object.assign({},e,{qi:String(i+1).padStart(2,'0'),ytPrimary:(e.yt||[])[0]||e.title}));
+  const approvedCount=list.filter(e=>e.status==='approved').length;
+  const rows=list.map(e=>
+    '<div style="display:flex;gap:18px;background:#13171e;border:1px solid #1f2530;border-radius:12px;padding:20px 22px;margin-bottom:14px;animation:obFade .2s ease both;">'
+    +'<div style="font-family:\'Spectral\',serif;font-size:34px;font-weight:600;color:#2c3444;line-height:1;flex-shrink:0;width:40px;">'+e.qi+'</div>'
+    +'<div style="flex:1;min-width:0;">'
+      +'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">'
+        +'<span style="'+MONO+'font-size:10px;font-weight:600;color:'+e.catColor+';background:'+e.catTint+';padding:3px 8px;border-radius:5px;">'+esc(e.cat)+'</span>'
+        +'<span style="display:flex;align-items:center;gap:5px;font-size:12px;color:'+e.toneColor+';"><span style="width:6px;height:6px;border-radius:50%;background:'+e.toneColor+';"></span>'+esc(e.tone)+'</span>'
+        +(e.status==='shipped'?'<span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.05em;color:#f2b64a;background:rgba(242,182,74,.15);padding:3px 8px;border-radius:5px;">SHIPPED</span>':'')
+        +'<span style="margin-left:auto;display:flex;align-items:center;gap:8px;"><span style="display:flex;gap:1px;font-size:13px;">'+e.starColors.map(c=>'<span style="color:'+c+';">★</span>').join('')+'</span><span style="'+MONO+'font-size:13px;color:#f2b64a;font-weight:600;">'+e.overallStr+'</span></span>'
+      +'</div>'
+      +'<div style="font-family:\'Spectral\',serif;font-size:22px;font-weight:600;line-height:1.24;color:#f6f2ea;margin-bottom:8px;letter-spacing:-.01em;">'+esc(e.title)+'</div>'
+      +'<div style="display:flex;gap:8px;font-size:14px;color:#cfd4de;margin-bottom:8px;"><span style="color:'+e.catColor+';flex-shrink:0;">▸</span><span style="font-weight:500;">'+esc(e.ytPrimary)+'</span></div>'
+      +'<div style="font-size:13.5px;line-height:1.6;color:#9aa3b2;margin-bottom:14px;">'+esc(e.summary)+'</div>'
+      +'<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+        +'<button data-act="footage:'+e.id+'" class="hvB" style="cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:7px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">🎬 Footage &amp; script</button>'
+        +'<a href="/api/story/'+e.id+'/brief" class="hvBrief" style="display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:7px;border:1px solid #2a313d;background:#181d26;color:#dfe3ea;transition:border-color .12s,color .12s;">⬇ Brief</a>'
+        +'<button data-act="sendback:'+e.id+'" class="hvNeu" style="cursor:pointer;font-size:12.5px;font-weight:500;padding:7px 14px;border-radius:7px;border:1px solid #242a35;background:#12161d;color:#9aa3b2;transition:border-color .12s,color .12s;">↩ Send back</button>'
+      +'</div>'
+      +renderBlock(e)
+    +'</div></div>').join('');
+  return '<div style="max-width:900px;margin:0 auto;padding:26px 24px 80px;">'
+    +'<div style="display:flex;align-items:center;gap:11px;background:rgba(242,182,74,.07);border:1px solid rgba(242,182,74,.2);border-radius:11px;padding:14px 18px;margin-bottom:24px;">'
+      +'<span style="font-size:20px;">◆</span>'
+      +'<div style="font-size:14px;color:#e8dcc4;line-height:1.5;"><strong style="color:#f2b64a;">'+approvedCount+' stories greenlit.</strong> Approving queues a render — previews land right here when the pipeline finishes.</div>'
+      +'<a href="/api/briefs" class="hvB" style="margin-left:auto;flex-shrink:0;display:inline-flex;cursor:pointer;font-size:12.5px;font-weight:600;padding:9px 14px;border-radius:8px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">⬇ Export all briefs</a>'
+    +'</div>'
+    +(list.length===0?'<div style="text-align:center;padding:70px 20px;color:#5b6270;"><div style="font-size:34px;margin-bottom:10px;opacity:.5;">◇</div><div style="font-size:15px;color:#8b93a2;">Nothing greenlit yet. Approve 4★+ drafts and they land here.</div></div>':'')
+    +rows+'</div>';
+}
+
+function rubricView(){
+  const cards=CRITERIA.map(c=>
+    '<div style="background:#13171e;border:1px solid #1f2530;border-radius:11px;padding:17px 18px;">'
+    +'<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px;"><div style="font-size:16px;font-weight:600;color:#f4f6fa;">'+c.label+'</div><span style="'+MONO+'font-size:11px;font-weight:600;color:#f2b64a;background:rgba(242,182,74,.1);padding:2px 8px;border-radius:5px;">'+c.weight+'</span></div>'
+    +'<div style="font-size:13px;line-height:1.55;color:#9aa3b2;margin-bottom:13px;">'+c.desc+'</div>'
+    +'<div style="display:flex;gap:9px;margin-bottom:8px;"><span style="'+MONO+'font-size:10px;font-weight:600;color:#e0757a;background:rgba(226,90,95,.11);padding:2px 7px;border-radius:4px;height:fit-content;flex-shrink:0;margin-top:1px;">1★</span><span style="font-size:12.5px;line-height:1.5;color:#8b93a2;">'+c.one+'</span></div>'
+    +'<div style="display:flex;gap:9px;"><span style="'+MONO+'font-size:10px;font-weight:600;color:#5fe0a0;background:rgba(52,211,153,.11);padding:2px 7px;border-radius:4px;height:fit-content;flex-shrink:0;margin-top:1px;">5★</span><span style="font-size:12.5px;line-height:1.5;color:#c3cad6;">'+c.five+'</span></div>'
+    +'</div>').join('');
+  const tones=TONEGUIDE.map(t=>{const col=TONECOLOR[t.tone];return '<div style="display:flex;gap:14px;background:#13171e;border:1px solid #1f2530;border-left:3px solid '+col+';border-radius:4px 10px 10px 4px;padding:14px 18px;">'
+    +'<div style="display:flex;align-items:center;gap:8px;min-width:200px;flex-shrink:0;font-size:14px;font-weight:600;color:'+col+';"><span style="width:8px;height:8px;border-radius:50%;background:'+col+';"></span>'+t.tone+'</div>'
+    +'<div style="font-size:13.5px;line-height:1.6;color:#a7aebb;">'+t.desc+'</div></div>';}).join('');
+  const th=(S.threshold??4).toFixed(1);
+  return '<div style="max-width:920px;margin:0 auto;padding:30px 24px 90px;">'
+    +'<div style="font-family:\'Spectral\',serif;font-size:30px;font-weight:600;color:#f6f2ea;letter-spacing:-.015em;margin-bottom:8px;">How '+esc(S.botName)+' scores every story</div>'
+    +'<div style="font-size:15px;line-height:1.65;color:#9aa3b2;max-width:660px;margin-bottom:22px;">Each draft is rated 1–5★ on eight dimensions. The overall score is a <strong style="color:#cfd4de;">weighted average</strong> — hooks and virality count most because this channel runs on Shorts, where the first three seconds decide everything.</div>'
+    +'<div style="display:flex;gap:14px;flex-wrap:wrap;background:rgba(242,182,74,.06);border:1px solid rgba(242,182,74,.2);border-radius:12px;padding:18px 20px;margin-bottom:30px;">'
+      +'<div style="flex:1;min-width:220px;"><div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.1em;color:#f2b64a;margin-bottom:6px;">GREENLIGHT RULE</div><div style="font-size:13.5px;line-height:1.6;color:#d8c9ab;">A story is auto-tagged <strong style="color:#5fe0a0;">RECOMMENDED</strong> only when its weighted score is <strong style="color:#f2b64a;">'+th+'★ or higher</strong> and no single dimension falls below 3★. Those flow straight to the production queue.</div></div>'
+      +'<div style="width:1px;background:rgba(242,182,74,.18);"></div>'
+      +'<div style="flex:1;min-width:220px;"><div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.1em;color:#7b8291;margin-bottom:6px;">EVERYTHING ELSE</div><div style="font-size:13.5px;line-height:1.6;color:#a7aebb;"><strong style="color:#f2b64a;">3.0–3.9★</strong> is tagged REVIEW and waits for your call. <strong style="color:#8b93a2;">Under 3.0★</strong> is auto-flagged PASS — visible, but never recommended.</div></div>'
+    +'</div>'
+    +'<div style="'+MONO+'font-size:11px;font-weight:600;letter-spacing:.14em;color:#6b7280;margin-bottom:14px;">THE EIGHT CRITERIA</div>'
+    +'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:14px;margin-bottom:36px;">'+cards+'</div>'
+    +'<div style="'+MONO+'font-size:11px;font-weight:600;letter-spacing:.14em;color:#6b7280;margin-bottom:14px;">TONE GUIDE · WHAT '+esc(S.botName.toUpperCase())+' RECOMMENDS</div>'
+    +'<div style="display:flex;flex-direction:column;gap:10px;">'+tones+'</div></div>';
+}
+
+function modalView(enriched){
+  if(!S.openStory) return '';
+  const e=enriched.find(x=>x.id===S.openStory);
+  if(!e) return '';
+  const ovTab=S.modalTab!=='script';
+  const overviewHtml=
+    '<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin-bottom:11px;">SCORE BREAKDOWN</div>'
+    +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:9px 20px;margin-bottom:20px;">'
+    +e.breakdown.map(b=>'<div><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;"><span style="color:#a7aebb;">'+b.label+'</span><span style="'+MONO+'font-weight:600;color:'+b.color+';">'+b.score+'</span></div><div style="height:5px;background:#1a1f28;border-radius:3px;overflow:hidden;"><div style="height:100%;width:'+b.pctStr+';background:'+b.color+';border-radius:3px;"></div></div></div>').join('')
+    +'</div>'
+    +'<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin-bottom:8px;">HOOK</div>'
+    +'<div style="font-family:\'Spectral\',serif;font-style:italic;font-size:17px;line-height:1.5;color:#e6d9c1;border-left:2px solid #f2b64a;padding-left:14px;margin-bottom:18px;">“'+esc(e.hook)+'”</div>'
+    +'<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin-bottom:8px;">SUMMARY</div>'
+    +'<div style="font-size:14.5px;line-height:1.65;color:#b9c0cd;margin-bottom:18px;">'+esc(e.summary)+'</div>'
+    +'<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin-bottom:9px;">SUGGESTED YOUTUBE TITLES</div>'
+    +'<div style="margin-bottom:18px;">'+(e.yt||[]).map(y=>'<div style="display:flex;gap:9px;font-size:14px;color:#dfe3ea;line-height:1.5;padding:7px 0;border-bottom:1px solid #171c25;"><span style="color:'+e.catColor+';flex-shrink:0;">▸</span><span>'+esc(y)+'</span></div>').join('')+'</div>'
+    +(e.hasSource?'<div style="display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:#8b93a2;background:#0f131a;border:1px solid #1c212b;border-radius:8px;padding:10px 13px;margin-bottom:20px;"><span style="'+MONO+'font-size:9.5px;font-weight:600;letter-spacing:.06em;color:#5eead4;background:rgba(94,234,212,.1);padding:2px 6px;border-radius:4px;flex-shrink:0;margin-top:1px;">TRUE STORY</span><span style="line-height:1.5;word-break:break-all;">'+e.sources.map(u=>'<a href="'+esc(u)+'" target="_blank" rel="noopener">'+esc(u)+'</a>').join('<br>')+'</span></div>':'');
+  const scriptHtml=e.beats.length?
+    '<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.12em;color:#6b7280;margin-bottom:6px;">NARRATION SCRIPT · '+e.beatCount+' SHOTS</div>'
+    +'<div style="font-size:12.5px;line-height:1.55;color:#8b93a2;margin-bottom:16px;">Each shot pairs a line of voiceover with background footage. Tap a keyword to open matching stock video on Envato Elements — gold chips are the clips the pipeline actually picked.</div>'
+    +e.beats.map(b=>'<div style="display:flex;gap:14px;margin-bottom:15px;">'
+      +'<div style="'+MONO+'font-size:12px;font-weight:600;color:#f2b64a;flex-shrink:0;padding-top:1px;width:20px;">'+b.idx+'</div>'
+      +'<div style="flex:1;min-width:0;border-left:1px solid #1e2430;padding-left:14px;">'
+        +'<div style="font-family:\'Spectral\',serif;font-size:16px;line-height:1.5;color:#eae4d6;margin-bottom:9px;">'+esc(b.n)+'</div>'
+        +'<div style="display:flex;gap:8px;align-items:baseline;font-size:12.5px;color:#9aa3b2;margin-bottom:10px;"><span style="'+MONO+'font-size:9px;font-weight:600;letter-spacing:.06em;color:#7b8291;flex-shrink:0;">ON SCREEN</span><span style="line-height:1.5;">'+esc(b.v)+'</span></div>'
+        +'<div style="display:flex;flex-wrap:wrap;gap:7px;">'
+        +b.chips.map(c=>'<a href="'+esc(c.url)+'" target="_blank" rel="noopener" class="hvChip" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-size:12px;font-weight:500;color:#9fb0ba;background:#0f131a;border:1px solid #233038;border-radius:20px;padding:5px 11px;transition:border-color .12s,color .12s,background .12s;"><span style="color:#4fd1c5;font-size:9px;">▶</span>'+esc(c.kw)+'</a>').join('')
+        +(b.chosen?'<a href="'+esc(b.chosen.url)+'" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-size:12px;font-weight:600;color:#f2b64a;background:rgba(242,182,74,.08);border:1px solid rgba(242,182,74,.35);border-radius:20px;padding:5px 11px;"><span style="font-size:9px;">▶</span>chosen · '+esc(b.chosen.source)+'</a>':'')
+        +'</div></div></div>').join('')
+    +'<div style="display:flex;gap:9px;flex-wrap:wrap;align-items:center;background:#0f131a;border:1px solid #1c212b;border-radius:10px;padding:13px 15px;margin-top:4px;">'
+      +'<div style="flex:1;min-width:150px;font-size:12px;line-height:1.5;color:#8b93a2;">Hand the whole story to your editor or voiceover artist.</div>'
+      +'<a href="/api/story/'+e.id+'/brief" class="hvB" style="display:inline-flex;cursor:pointer;font-size:12.5px;font-weight:600;padding:9px 14px;border-radius:8px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">⬇ Full brief</a>'
+      +'<a href="/api/story/'+e.id+'/script" class="hvBrief" style="display:inline-flex;cursor:pointer;font-size:12.5px;font-weight:600;padding:9px 14px;border-radius:8px;border:1px solid #2a313d;background:#181d26;color:#dfe3ea;">⬇ Script only</a>'
+    +'</div>'
+    :'<div style="text-align:center;padding:40px 20px;color:#5b6270;"><div style="font-size:28px;margin-bottom:10px;opacity:.5;">🎬</div><div style="font-size:14px;color:#8b93a2;">No shot list yet — the script is written when the story is approved.</div></div>';
+  return '<div data-act="closeModal" style="position:fixed;inset:0;z-index:100;background:rgba(6,8,11,.82);display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;animation:obFade .15s ease;">'
+    +'<div data-modal style="width:100%;max-width:640px;background:#12161d;border:1px solid #262d38;border-radius:16px;box-shadow:0 30px 80px rgba(0,0,0,.6);overflow:hidden;animation:obUp .22s ease both;">'
+    +'<div style="height:5px;background:'+e.catColor+';"></div>'
+    +'<div style="padding:24px 26px;">'
+      +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">'
+        +'<span style="'+MONO+'font-size:10.5px;font-weight:600;color:'+e.catColor+';background:'+e.catTint+';padding:3px 9px;border-radius:5px;">'+esc(e.cat)+'</span>'
+        +'<span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.05em;color:'+e.tierColor+';background:'+e.tierBg+';padding:3px 9px;border-radius:5px;">'+e.tierLabel+'</span>'
+        +'<span style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.05em;color:'+e.statusColor+';background:'+e.statusBg+';padding:3px 9px;border-radius:5px;">'+e.statusLabel+'</span>'
+        +'<button data-act="closeModal" class="hvX" style="margin-left:auto;cursor:pointer;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:#1a1f28;color:#8b93a2;font-size:16px;transition:background .12s,color .12s;">✕</button>'
+      +'</div>'
+      +'<div style="font-family:\'Spectral\',serif;font-size:27px;font-weight:600;line-height:1.22;color:#f6f2ea;letter-spacing:-.015em;margin-bottom:14px;">'+esc(e.title)+'</div>'
+      +'<div style="display:flex;align-items:center;gap:16px;background:#0f131a;border:1px solid #1c212b;border-radius:11px;padding:14px 18px;margin-bottom:18px;">'
+        +'<div style="text-align:center;"><div style="font-family:\'Spectral\',serif;font-size:38px;font-weight:700;color:#f2b64a;line-height:1;">'+e.overallStr+'</div><div style="'+MONO+'font-size:9px;color:#6b7280;letter-spacing:.1em;margin-top:3px;">OVERALL</div></div>'
+        +'<div style="width:1px;height:44px;background:#232a35;"></div>'
+        +'<div><div style="display:flex;gap:2px;font-size:18px;margin-bottom:5px;">'+e.starColors.map(c=>'<span style="color:'+c+';">★</span>').join('')+'</div>'
+        +'<div style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:'+e.toneColor+';"><span style="width:7px;height:7px;border-radius:50%;background:'+e.toneColor+';"></span>Suggested tone · '+esc(e.tone)+'</div></div>'
+      +'</div>'
+      +'<div style="display:flex;gap:4px;background:#0f131a;border:1px solid #1c212b;border-radius:9px;padding:4px;margin-bottom:18px;">'
+        +'<button data-act="tabOverview" style="flex:1;cursor:pointer;font-size:12.5px;font-weight:600;padding:8px 6px;border-radius:6px;border:0;background:'+(ovTab?'#242a35':'transparent')+';color:'+(ovTab?'#f4f6fa':'#8b93a2')+';transition:background .12s,color .12s;">Overview &amp; rating</button>'
+        +'<button data-act="tabScript" style="flex:1;cursor:pointer;font-size:12.5px;font-weight:600;padding:8px 6px;border-radius:6px;border:0;background:'+(!ovTab?'#242a35':'transparent')+';color:'+(!ovTab?'#f4f6fa':'#8b93a2')+';transition:background .12s,color .12s;">🎬 Script &amp; footage</button>'
+      +'</div>'
+      +(ovTab?overviewHtml:scriptHtml)
+      +'<div style="display:flex;gap:9px;border-top:1px solid #1c212b;padding-top:18px;">'
+        +'<button data-act="approve:'+e.id+'" class="hvB2" '+(e.status==='shipped'?'disabled':'')+' style="flex:1;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;font-size:13.5px;font-weight:600;padding:11px;border-radius:9px;border:1px solid '+e.approveBorder+';background:'+e.approveBg+';color:'+e.approveFg+';transition:filter .12s;">✓ '+e.approveLabel+'</button>'
+        +'<button data-act="reject:'+e.id+'" class="hvRej" style="cursor:pointer;font-size:13.5px;font-weight:600;padding:11px 18px;border-radius:9px;border:1px solid '+e.rejectBorder+';background:'+e.rejectBg+';color:'+e.rejectFg+';transition:border-color .12s,color .12s;">✕ Pass</button>'
+        +'<button data-act="regen:'+e.id+'" class="hvNeu" style="cursor:pointer;font-size:13.5px;font-weight:500;padding:11px 18px;border-radius:9px;border:1px solid #242a35;background:#12161d;color:#9aa3b2;transition:border-color .12s,color .12s;">'+(S.busyRegen[e.id]?'⟳ drafting…':'⟳ Regenerate')+'</button>'
+      +'</div>'
+    +'</div></div></div>';
+}
+
+// ---- settings / options view -------------------------------------------------------
+function settingsView(){
+  const s=S.settings||{render:{footage:true,music:true,captions:true},categories:[]};
+  const rd=s.render||{footage:true,music:true,captions:true};
+  const cat=S.catCatalog||[];
+  const sw=(key,on)=>'<button data-act="stage:'+key+'" style="cursor:pointer;border:0;flex-shrink:0;width:48px;height:27px;border-radius:20px;background:'+(on?'#5fe0a0':'#2a313d')+';position:relative;transition:background .15s;"><span style="position:absolute;top:3px;left:'+(on?'24px':'3px')+';width:21px;height:21px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.4);transition:left .15s;"></span></button>';
+  const row=(key,label,desc,on)=>'<div style="display:flex;align-items:center;gap:16px;padding:15px 2px;border-bottom:1px solid #171c25;">'
+    +'<div style="flex:1;min-width:0;"><div style="font-size:14.5px;font-weight:600;color:#e8eaf0;">'+label+'</div><div style="font-size:12.5px;color:#8b93a2;margin-top:2px;line-height:1.5;">'+desc+'</div></div>'+sw(key,on)+'</div>';
+  const stages=row('footage','Footage','Fetch stock b-roll for every shot. Off → a clean dark backdrop under the voice &amp; captions (no footage key needed — great for adding your own footage later).',rd.footage!==false)
+    +row('music','Music','Lay a ducked music bed under the narration (from your music/ folders). Off → voice only.',rd.music!==false)
+    +row('captions','Captions','Burn karaoke subtitles onto the video. Off → clean, no on-screen text.',rd.captions!==false);
+  const chips=cat.map(c=>{const on=catOn(c.key);return '<button data-act="cat:'+c.key+'" style="cursor:pointer;font-size:12.5px;font-weight:500;padding:8px 13px;border-radius:20px;border:1px solid '+(on?'rgba(242,182,74,.4)':'#242a35')+';background:'+(on?'rgba(242,182,74,.12)':'#12161d')+';color:'+(on?'#f2b64a':'#6b7280')+';transition:all .12s;">'+(on?'✓ ':'')+esc(c.label)+'</button>';}).join('');
+  const nOn=cat.filter(c=>catOn(c.key)).length;
+  const box=(title,inner)=>'<div style="background:#13171e;border:1px solid #1f2530;border-radius:13px;padding:6px 20px 8px;margin-bottom:16px;"><div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.14em;color:#6b7280;padding:14px 0 4px;">'+title+'</div>'+inner+'</div>';
+  const agOn=!!(S.settings&&S.settings.autogen);
+  const dt=(S.settings&&S.settings.dailyTarget!=null)?S.settings.dailyTarget:12;
+  const dtOff=dt===0;
+  const swv=(on)=>'<span style="flex-shrink:0;width:48px;height:27px;border-radius:20px;background:'+(on?'#5fe0a0':'#2a313d')+';position:relative;transition:background .15s;"><span style="position:absolute;top:3px;left:'+(on?'24px':'3px')+';width:21px;height:21px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.4);transition:left .15s;"></span></span>';
+  const dtBox='<div data-act="autogenToggle" style="display:flex;align-items:center;gap:14px;padding:4px 0 14px;cursor:pointer;"><div style="flex:1;"><div style="font-size:14.5px;font-weight:600;color:#e8eaf0;">Auto-generate drafts</div><div style="font-size:12.5px;color:#8b93a2;margin-top:2px;line-height:1.55;">'+(agOn?'On — '+esc(S.botName)+' writes drafts through the day on its own.':'Off — nothing generates until you click <strong style="color:#cfd4de;">Generate</strong>. (Recommended.)')+'</div></div>'+swv(agOn)+'</div>'
+    +(agOn?('<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.13em;color:#6b7280;margin:8px 0 9px;border-top:1px solid #171c25;padding-top:14px;">HOW MANY PER DAY</div>'
+      +'<div style="font-size:12px;color:#8b93a2;margin-bottom:12px;line-height:1.5;">Or <strong style="color:#cfd4de;">Off</strong> = no daily limit (drafts ~hourly). Drafts are Anthropic-only — no render cost until you approve one.</div>'
+      +'<div style="display:flex;align-items:center;gap:8px;background:#12161d;border:1px solid #1e2430;border-radius:10px;padding:6px;width:fit-content;">'
+        +'<button data-act="dtDec" class="hvX" style="width:34px;height:34px;cursor:pointer;border:0;border-radius:8px;background:#1a1f28;color:#dfe3ea;font-size:19px;font-weight:600;display:flex;align-items:center;justify-content:center;">−</button>'
+        +'<div style="min-width:76px;text-align:center;padding:0 6px;"><div style="'+MONO+'font-size:'+(dtOff?'15':'20')+'px;font-weight:600;color:'+(dtOff?'#5fe0a0':'#f4f6fa')+';line-height:1;">'+(dtOff?'∞ Off':dt)+'</div><div style="'+MONO+'font-size:9px;letter-spacing:.1em;color:#6b7280;margin-top:3px;">'+(dtOff?'NO LIMIT':'/ DAY')+'</div></div>'
+        +'<button data-act="dtInc" class="hvX" style="width:34px;height:34px;cursor:pointer;border:0;border-radius:8px;background:#1a1f28;color:#dfe3ea;font-size:18px;font-weight:600;display:flex;align-items:center;justify-content:center;">+</button>'
+      +'</div>'):'');
+  const cap=(S.settings&&S.settings.maxRenders!=null)?S.settings.maxRenders:5;
+  const capOff=cap===0;
+  const capBox='<div style="font-size:12.5px;color:#8b93a2;margin:2px 0 14px;line-height:1.6;">How many videos can render per day, or <strong style="color:#cfd4de;">Off</strong> for no limit. A cap protects your <strong style="color:#cfd4de;">ElevenLabs credits</strong> — every ~60-second Short spends roughly 1,100 of them — but it only limits <em>rendering</em>; drafts and scripts are always unlimited.</div>'
+    +'<div style="display:flex;align-items:center;gap:8px;background:#12161d;border:1px solid #1e2430;border-radius:10px;padding:6px;width:fit-content;">'
+      +'<button data-act="capDec" class="hvX" style="width:34px;height:34px;cursor:pointer;border:0;border-radius:8px;background:#1a1f28;color:#dfe3ea;font-size:19px;font-weight:600;display:flex;align-items:center;justify-content:center;">−</button>'
+      +'<div style="min-width:70px;text-align:center;padding:0 6px;"><div style="'+MONO+'font-size:'+(capOff?'15':'20')+'px;font-weight:600;color:'+(capOff?'#5fe0a0':'#f4f6fa')+';line-height:1;">'+(capOff?'∞ Off':cap)+'</div><div style="'+MONO+'font-size:9px;letter-spacing:.1em;color:#6b7280;margin-top:3px;">'+(capOff?'NO LIMIT':'/ DAY')+'</div></div>'
+      +'<button data-act="capInc" class="hvX" style="width:34px;height:34px;cursor:pointer;border:0;border-radius:8px;background:#1a1f28;color:#dfe3ea;font-size:18px;font-weight:600;display:flex;align-items:center;justify-content:center;">+</button>'
+    +'</div>';
+  // Global caption/voice/music STYLE — the default look for every render.
+  if(!S.prod) loadProduction();
+  const gcap=globalCap();
+  const style=styleControls({cap:gcap, capOn:rd.captions!==false, musOn:rd.music!==false,
+    curVoice:rd.voice||'', curTrack:rd.music_track||'', toneKey:null, tone:'', title:'', global:true});
+  const styleBox='<div style="background:#13171e;border:1px solid #26405a;border-radius:13px;padding:6px 20px 18px;margin-bottom:16px;box-shadow:0 0 0 1px rgba(58,116,168,.15);">'
+    +'<div style="display:flex;align-items:center;gap:8px;'+MONO+'font-size:10px;font-weight:600;letter-spacing:.14em;color:#7fb0d8;padding:14px 0 2px;">🎨 DEFAULT LOOK · APPLIES TO EVERY RENDER</div>'
+    +'<div style="font-size:12.5px;color:#8b93a2;margin:2px 0 4px;line-height:1.55;">Set your captions, voice and music <strong style="color:#cfd4de;">once here</strong> and every video uses them — you never have to touch a single story. Need one story different? Open <strong style="color:#f2b64a;">🎨 Style</strong> on its card to override just that one. Everything saves the moment you click.</div>'
+    +'<div id="styleZone">'+style+'</div></div>';
+  return '<div style="max-width:820px;margin:0 auto;padding:26px 24px 80px;">'
+    +'<div style="font-size:14px;color:#9aa3b2;line-height:1.6;margin-bottom:20px;">These are your <strong style="color:#cfd4de;">defaults</strong> — set them once. Every new render uses them; you can still open <strong style="color:#f2b64a;">🎨 Style</strong> on an individual story to override it.</div>'
+    +box('PRODUCTION · WHAT EACH RENDER INCLUDES',stages)
+    +styleBox
+    +box('STORY CATEGORIES · WHAT GETS GENERATED',
+        '<div style="font-size:12.5px;color:#8b93a2;margin:2px 0 14px;line-height:1.5;">Auto-generation and Generate only draft from the categories you pick ('+nOn+' of '+cat.length+' on). Tap to toggle.</div>'
+        +'<div style="display:flex;flex-wrap:wrap;gap:9px;padding-bottom:6px;">'+chips+'</div>')
+    +box('DAILY DRAFT TARGET',dtBox)
+    +box('DAILY RENDER CAP',capBox)
+    +'</div>';
+}
+
+// ---- per-story Style & Music editor -----------------------------------------------
+const ANIM_LABEL={sweep:'Karaoke sweep',fade:'Fade in',pop:'Pop',plain:'Plain'};
+const SIZE_LABEL={small:'Small',medium:'Medium',large:'Large',xl:'X-Large'};
+const POS_LABEL={high:'High',mid:'Middle',low:'Low'};
+function capPos(cap){ return (typeof cap.pos==='number')?cap.pos:({high:30,mid:55,low:72}[cap.pos]||55); }
+function capBg(cap){ return (typeof cap.bg==='number')?cap.bg:0; }
+// size: number = font px at 1080 wide; legacy enum mapped to its px equivalent
+function capSizeN(cap){ return (typeof cap.size==='number')?cap.size:({small:76,medium:92,large:108,xl:127}[cap.size]||92); }
+function capPreview(cap,sample){
+  const sizePx=Math.round(capSizeN(cap)*0.207);   // preview frame is 150px wide
+  const posPct=capPos(cap), bg=capBg(cap);
+  const words=sample.split(/\s+/).filter(Boolean).slice(0,cap.words||2).join(' ');
+  const txt=cap.upper?words.toUpperCase():words;
+  const anim={fade:'obPvFade .55s ease',pop:'obPvPop .55s cubic-bezier(.2,1.4,.4,1)'}[cap.anim]||'';
+  const k=[cap.font,cap.color,cap.size,cap.anim,cap.upper,cap.words].join('|');   // pos/bg update live, not via re-mount
+  // checkerboard so transparency reads visually
+  const checker='background-image:linear-gradient(45deg,#161b23 25%,transparent 25%),linear-gradient(-45deg,#161b23 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#161b23 75%),linear-gradient(-45deg,transparent 75%,#161b23 75%);background-size:16px 16px;background-position:0 0,0 8px,8px -8px,-8px 0;background-color:#0b0d10;';
+  return '<div style="width:150px;height:266px;flex-shrink:0;border-radius:14px;border:1px solid #232a35;overflow:hidden;position:relative;'+checker+'">'
+    +'<div id="obPvBg" style="position:absolute;inset:0;background:#0E1116;opacity:'+(bg/100)+';"></div>'
+    +'<div id="obPvText" data-pvkey="'+esc(k)+'" style="position:absolute;left:7px;right:7px;top:'+posPct+'%;transform:translateY(-50%);text-align:center;font-family:\''+esc(cap.font)+'\',\'Arial Narrow\',sans-serif;font-weight:800;color:'+esc(cap.color)+';font-size:'+sizePx+'px;line-height:1.1;text-shadow:0 2px 5px rgba(0,0,0,.85),0 0 2px #000;'+(anim?'animation:'+anim+';':'')+'">'+esc(txt)+'</div>'
+    +'<div style="position:absolute;bottom:7px;left:0;right:0;text-align:center;'+MONO+'font-size:8px;letter-spacing:.1em;color:#5b6270;background:rgba(0,0,0,.3);">PREVIEW · 9:16</div>'
+  +'</div>';
+}
+// Shared caption/voice/music controls. ctx.global=true → editing the Production
+// defaults (no single tone); else a specific story. Same data-acts either way;
+// the handlers route via styleTarget().
+function styleControls(ctx){
+  const {cap,capOn,musOn,curVoice,curTrack,toneKey,tone,title}=ctx, glob=!!ctx.global, p=S.prod;
+  const chip=(act,on,label,extra)=>'<button data-act="'+act+'" style="cursor:pointer;font-size:12.5px;font-weight:500;padding:7px 13px;border-radius:9px;border:1px solid '+(on?'rgba(242,182,74,.45)':'#242a35')+';background:'+(on?'rgba(242,182,74,.13)':'#12161d')+';color:'+(on?'#f2b64a':'#9aa3b2')+';transition:all .12s;'+(extra||'')+'">'+(on?'✓ ':'')+esc(label)+'</button>';
+  const sw=(on)=>'<span style="flex-shrink:0;width:44px;height:25px;border-radius:20px;background:'+(on?'#5fe0a0':'#2a313d')+';position:relative;transition:background .15s;"><span style="position:absolute;top:3px;left:'+(on?'22px':'3px')+';width:19px;height:19px;border-radius:50%;background:#fff;transition:left .15s;"></span></span>';
+  const lbl=t=>'<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.13em;color:#6b7280;margin:18px 0 9px;">'+t+'</div>';
+  // ---- captions ----
+  let capBody='';
+  if(!p){ capBody='<div style="color:#8b93a2;font-size:13px;padding:8px 0;">loading fonts…</div>'; }
+  else if(capOn){
+    const fonts=(p.fonts||[]).map(f=>{const on=cap.font===f.name;return '<button data-act="capFont:'+encodeURIComponent(f.name)+'" style="cursor:pointer;font-size:14px;padding:7px 13px;border-radius:9px;border:1px solid '+(on?'rgba(242,182,74,.45)':'#242a35')+';background:'+(on?'rgba(242,182,74,.13)':'#12161d')+';color:'+(on?'#f2b64a':'#dfe3ea')+';font-family:\''+esc(f.name)+'\',sans-serif;line-height:1.1;">'+(on?'✓ ':'')+esc(f.name)+'</button>';}).join('');
+    const swatches=(p.swatches||[]).map(c=>'<button data-act="capColor:'+encodeURIComponent(c)+'" title="'+c+'" style="cursor:pointer;width:28px;height:28px;border-radius:8px;background:'+c+';border:2px solid '+(cap.color.toLowerCase()===c.toLowerCase()?'#fff':'transparent')+';box-shadow:0 0 0 1px #000 inset;"></button>').join('');
+    const words=[1,2,3].map(n=>chip('capWords:'+n,(cap.words||2)===n,n+(n===1?' word':' words'))).join('');
+    const anims=(p.anims||[]).map(a=>chip('capAnim:'+a,cap.anim===a,ANIM_LABEL[a]||a)).join('');
+    const posN=capPos(cap), bgN=capBg(cap), sizeN=capSizeN(cap);
+    const slider=(w,min,max,val)=>'<input type="range" data-slider="'+w+'" min="'+min+'" max="'+max+'" value="'+val+'" style="flex:1;height:5px;accent-color:#f2b64a;cursor:pointer;">';
+    const controls=lbl('FONT')+'<div style="display:flex;flex-wrap:wrap;gap:6px;">'+fonts
+        +'<label class="hvNeu" style="cursor:pointer;font-size:12.5px;font-weight:500;padding:7px 13px;border-radius:9px;border:1px dashed #3a4453;background:#12161d;color:#9aa3b2;">↑ Upload .ttf<input type="file" accept=".ttf,.otf" data-fontup style="display:none;"></label></div>'
+      +lbl('HIGHLIGHT COLOUR')+'<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">'+swatches+'</div>'
+      +lbl('WORDS PER CAPTION')+'<div style="display:flex;flex-wrap:wrap;gap:6px;">'+words+'</div>'
+      +lbl('SIZE')+'<div style="display:flex;align-items:center;gap:10px;"><span style="font-size:11px;font-weight:700;color:#6b7280;">A</span>'+slider('size',50,170,sizeN)+'<span style="font-size:19px;font-weight:700;color:#6b7280;">A</span><span id="obSzLbl" style="'+MONO+'font-size:10px;color:#8b93a2;min-width:38px;text-align:right;">'+sizeN+'px</span></div>'
+      +lbl('ANIMATION')+'<div style="display:flex;flex-wrap:wrap;gap:6px;">'+anims+'</div>'
+      +lbl('POSITION ON SCREEN')+'<div style="display:flex;align-items:center;gap:10px;"><span style="'+MONO+'font-size:9px;color:#6b7280;">TOP</span>'+slider('pos',8,92,posN)+'<span style="'+MONO+'font-size:9px;color:#6b7280;">BOT</span></div>'
+      +lbl('BACKGROUND · footage-off export')+'<div style="display:flex;align-items:center;gap:10px;"><span style="'+MONO+'font-size:9px;color:#6b7280;">CLEAR</span>'+slider('bg',0,100,bgN)+'<span style="'+MONO+'font-size:9px;color:#6b7280;">SOLID</span></div>'
+      +'<div id="obBgLbl" style="'+MONO+'font-size:10.5px;color:#8b93a2;margin-top:6px;line-height:1.5;">'+(bgN===0?'Fully transparent — captions float on your own footage':bgN+'% dark backdrop')+'</div>'
+      +'<div data-act="capUpper" style="display:flex;align-items:center;gap:12px;margin-top:16px;cursor:pointer;"><div style="flex:1;font-size:13.5px;color:#dfe3ea;">UPPERCASE text</div>'+sw(cap.upper)+'</div>';
+    capBody='<div style="display:flex;gap:18px;align-items:flex-start;margin-top:4px;">'
+      +'<div style="flex:1;min-width:0;">'+controls+'</div>'
+      +'<div style="flex-shrink:0;position:sticky;top:0;">'+capPreview(cap, (title||'YOUR CAPTIONS HERE'))+'<div style="'+MONO+'font-size:9px;color:#565d6b;text-align:center;margin-top:6px;line-height:1.5;">live preview · real font<br>(sizing ≈ final)</div></div>'
+    +'</div>';
+  }
+  // ---- voice ----
+  let voiceBody='';
+  if(p){
+    const vs=p.voices||[], tv=glob?null:(p.toneVoices||{})[toneKey];
+    if(vs.length){
+      const cur=curVoice;   // '' = tone default / auto
+      const vrow=(id,name,desc,isDefault)=>{const on=cur===id||(cur===''&&isDefault);const pl=id&&S.playing==='v:'+id;return '<div style="display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;border:1px solid '+(pl?'rgba(94,234,212,.65)':(on?'rgba(242,182,74,.4)':'#1f2530'))+';background:'+(pl?'rgba(94,234,212,.07)':(on?'rgba(242,182,74,.09)':'#12161d'))+';margin-bottom:6px;">'
+        +'<button data-act="voiceSet:'+(isDefault?'':id)+'" style="flex:1;min-width:0;display:flex;align-items:center;gap:9px;text-align:left;cursor:pointer;border:0;background:transparent;color:'+(on?'#f4f6fa':'#cfd4de')+';font:inherit;"><span style="color:'+(on?'#f2b64a':'#4a515f')+';flex-shrink:0;">'+(on?'●':'○')+'</span><span style="min-width:0;"><span style="font-size:13px;font-weight:600;">'+esc(name)+(isDefault?' <span style="'+MONO+'font-size:9px;color:#5fe0a0;">DEFAULT</span>':'')+'</span>'+(desc?'<span style="font-size:11px;color:#8b93a2;display:block;">'+esc(desc)+'</span>':'')+'</span></button>'
+        +(id?(function(){const pl=S.playing==='v:'+id;return '<button data-act="voicePlay:'+id+'" class="hvX" title="'+(pl?'Stop':'Hear sample')+'" style="flex-shrink:0;cursor:pointer;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:'+(pl?'rgba(242,182,74,.2)':'#1a1f28')+';color:#f2b64a;font-size:12px;">'+(pl?'⏸':'▶')+'</button>';})():'')
+      +'</div>';};
+      if(glob){
+        // global: no single tone, so the "default" is auto-per-tone
+        voiceBody='<div id="voiceList" style="margin-top:6px;max-height:270px;overflow-y:auto;padding-right:4px;">'
+          +vrow('', 'Auto — best voice per tone', 'SCOUT uses each story’s tone voice unless you pick one here', true)
+          +vs.map(v=>vrow(v.voice_id, v.name.split(' - ')[0], v.desc, false)).join('')
+        +'</div>';
+      } else {
+        const defV=vs.find(v=>v.voice_id===tv);
+        voiceBody='<div id="voiceList" style="margin-top:6px;max-height:270px;overflow-y:auto;padding-right:4px;">'
+          +(defV?vrow(defV.voice_id, defV.name.split(' - ')[0], defV.desc, true):'')
+          +vs.filter(v=>v.voice_id!==tv).map(v=>vrow(v.voice_id, v.name.split(' - ')[0], v.desc, false)).join('')
+        +'</div>';
+      }
+    } else {
+      voiceBody='<div style="font-size:12.5px;color:#8b93a2;margin-top:6px;line-height:1.55;">Voice list unavailable (the ElevenLabs key is TTS-only). Renders still use the per-tone default voice.</div>';
+    }
+  }
+  // ---- music ----
+  let musBody='';
+  if(musOn){
+    const lib=(p&&p.music)||{};
+    const trackBtn=(name,folder,folderLabel)=>{const on=curTrack===name;const pl=S.playing==='m:'+folder+'/'+name;return '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;border:1px solid '+(pl?'rgba(94,234,212,.65)':(on?'rgba(95,224,160,.4)':'#1f2530'))+';background:'+(pl?'rgba(94,234,212,.07)':(on?'rgba(52,211,153,.1)':'#12161d'))+';margin-bottom:6px;">'
+      +'<button data-act="capTrack:'+encodeURIComponent(name)+'" style="flex:1;min-width:0;display:flex;align-items:center;gap:9px;text-align:left;cursor:pointer;border:0;background:transparent;font:inherit;font-size:13px;color:'+(on?'#dfe3ea':'#b9c0cd')+';"><span style="color:'+(on?'#5fe0a0':'#4a515f')+';flex-shrink:0;">'+(on?'●':'○')+'</span><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">🎵 '+esc(name)+'</span>'+(folderLabel?'<span style="'+MONO+'font-size:9.5px;color:#6b7280;flex-shrink:0;">'+folderLabel+'</span>':'')+'</button>'
+      +(function(){const pl=S.playing==='m:'+folder+'/'+name;return '<button data-act="musicPlay:'+encodeURIComponent(folder)+':'+encodeURIComponent(name)+'" class="hvX" title="'+(pl?'Stop':'Preview')+'" style="flex-shrink:0;cursor:pointer;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:'+(pl?'rgba(242,182,74,.2)':'#1a1f28')+';color:#f2b64a;font-size:12px;">'+(pl?'⏸':'▶')+'</button>';})()
+    +'</div>';};
+    const autoOn=!curTrack;
+    let rows='', total=0;
+    if(glob){
+      // every folder's tracks, de-duplicated by name
+      const seen={};
+      Object.keys(lib).forEach(fol=>{ (lib[fol]||[]).forEach(t=>{ if(seen[t]) return; seen[t]=1; total++; rows+=trackBtn(t,fol,fol==='any'?'any':fol); }); });
+    } else {
+      const toneTracks=lib[toneKey]||[], anyTracks=lib['any']||[];
+      total=toneTracks.length+anyTracks.length;
+      rows=toneTracks.map(t=>trackBtn(t,toneKey,tone.split(' /')[0])).join('')+anyTracks.map(t=>trackBtn(t,'any','any')).join('');
+    }
+    const upFolder=glob?'any':toneKey, upLabel=glob?'your library':esc(tone.split(' /')[0]);
+    musBody='<div style="margin-top:8px;">'
+      +'<button data-act="capTrack:" style="display:flex;align-items:center;gap:9px;width:100%;text-align:left;cursor:pointer;font-size:13px;padding:9px 11px;border-radius:8px;border:1px solid '+(autoOn?'rgba(95,224,160,.4)':'#1f2530')+';background:'+(autoOn?'rgba(52,211,153,.1)':'#12161d')+';color:#dfe3ea;margin-bottom:6px;"><span style="color:'+(autoOn?'#5fe0a0':'#4a515f')+';">'+(autoOn?'●':'○')+'</span><span>🎲 Auto — random from your '+(glob?'tone':('<strong>'+esc(tone)+'</strong>'))+' tracks</span></button>'
+      +rows
+      +(total===0?'<div style="font-size:12.5px;color:#8b93a2;background:#0f131a;border:1px solid #1c212b;border-radius:8px;padding:11px 13px;line-height:1.55;">No music yet. Music comes from files you add — drop a track below (safe, royalty-free sources: Pixabay Music, YouTube Audio Library).</div>':'')
+      +'<label class="hvNeu" data-musicfolder="'+esc(upFolder)+'" style="display:inline-flex;align-items:center;gap:7px;margin-top:9px;cursor:pointer;font-size:12.5px;font-weight:500;padding:8px 14px;border-radius:9px;border:1px dashed #3a4453;background:#12161d;color:#9aa3b2;">↑ Upload track for '+(glob?'your library':('“'+upLabel+'”'))+'<input type="file" accept="audio/*" data-musicup style="display:none;"></label>'
+    +'</div>';
+  }
+  return ''
+    +'<div data-act="capToggle" style="display:flex;align-items:center;gap:12px;margin-top:16px;padding-top:16px;border-top:1px solid #1c212b;cursor:pointer;"><div style="flex:1;"><div style="font-size:15px;font-weight:600;color:#e8eaf0;">Captions</div><div style="font-size:12px;color:#8b93a2;margin-top:1px;">karaoke subtitles burned onto the video</div></div>'+sw(capOn)+'</div>'
+    +(capOn?'<div style="opacity:1;">'+capBody+'</div>':'')
+    +'<div style="display:flex;align-items:center;gap:12px;margin-top:20px;padding-top:16px;border-top:1px solid #1c212b;"><div style="flex:1;"><div style="font-size:15px;font-weight:600;color:#e8eaf0;">Voice</div><div style="font-size:12px;color:#8b93a2;margin-top:1px;">tap ▶ to hear a sample, then pick one</div></div></div>'
+    +voiceBody
+    +'<div data-act="musToggle" style="display:flex;align-items:center;gap:12px;margin-top:20px;padding-top:16px;border-top:1px solid #1c212b;cursor:pointer;"><div style="flex:1;"><div style="font-size:15px;font-weight:600;color:#e8eaf0;">Music</div><div style="font-size:12px;color:#8b93a2;margin-top:1px;">a ducked bed under the narration</div></div>'+sw(musOn)+'</div>'
+    +musBody;
+}
+function styleView(){
+  if(!S.styleStory) return '';
+  const e=S.stories.find(s=>s.id===S.styleStory);
+  if(!e) return '';
+  const o=e.opts||{};
+  const inner=styleControls({cap:storyCap(e), capOn:o.captions!==false, musOn:o.music!==false,
+    curVoice:o.voice||'', curTrack:o.music_track||'', toneKey:e.toneKey, tone:e.tone, title:e.title, global:false});
+  return '<div data-act="styleClose" style="position:fixed;inset:0;z-index:120;background:rgba(6,8,11,.82);display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto;animation:obFade .15s ease;">'
+    +'<div data-modal style="width:100%;max-width:680px;background:#12161d;border:1px solid #262d38;border-radius:16px;box-shadow:0 30px 80px rgba(0,0,0,.6);overflow:hidden;animation:obUp .22s ease both;">'
+    +'<div style="height:5px;background:linear-gradient(90deg,#f2b64a,#c8842a);"></div>'
+    +'<div style="padding:22px 26px 26px;">'
+      +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:2px;">'
+        +'<div style="font-family:\'Spectral\',serif;font-size:22px;font-weight:600;color:#f6f2ea;">Style, voice &amp; music</div>'
+        +'<button data-act="styleClose" class="hvX" style="margin-left:auto;cursor:pointer;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:#1a1f28;color:#8b93a2;font-size:16px;">✕</button>'
+      +'</div>'
+      +'<div style="font-size:12.5px;color:#8b93a2;margin-bottom:6px;">'+esc(e.title)+' · <span style="color:#f2b64a;">this story only</span> — Production tab sets the default for all</div>'
+      +'<div id="styleZone">'+inner+'</div>'
+      +'<div style="display:flex;align-items:center;gap:10px;margin-top:26px;padding-top:18px;border-top:1px solid #1c212b;">'
+        +'<button data-act="styleClose" class="hvNeu" style="cursor:pointer;font-size:13.5px;font-weight:500;padding:11px 20px;border-radius:20px;border:1px solid #3a4453;background:transparent;color:#9aa3b2;">Done</button>'
+        +'<button data-act="styleRender" class="hvB" style="flex:1;cursor:pointer;font-size:14px;font-weight:600;padding:12px;border-radius:20px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;">🎥 Render now</button>'
+      +'</div>'
+      +'<div style="display:flex;align-items:center;justify-content:center;gap:6px;'+MONO+'font-size:10px;color:#5fe0a0;text-align:center;margin-top:9px;"><span style="width:6px;height:6px;border-radius:50%;background:#5fe0a0;"></span>changes save automatically as you click — “Render now” re-cuts the video with them (fast)</div>'
+    +'</div></div></div>';
+}
+
+// ---- generate composer (count + category + tone, or leave on Auto) -----------------
+// inner content only — repainted in place by repaintComposer() so chip clicks
+// and the count slider never re-mount the modal (no flash, no animation replay)
+function composerBody(){
+  const n=S.genCount||3, max=S.genMax||10;
+  const chip=(act,on,label,dot)=>'<button data-act="'+act+'" style="cursor:pointer;font-size:12.5px;font-weight:500;padding:8px 13px;border-radius:20px;border:1px solid '+(on?'rgba(242,182,74,.45)':'#242a35')+';background:'+(on?'rgba(242,182,74,.13)':'#12161d')+';color:'+(on?'#f2b64a':'#9aa3b2')+';transition:all .12s;display:inline-flex;align-items:center;gap:7px;">'+(dot?'<span style="width:7px;height:7px;border-radius:50%;background:'+dot+';"></span>':'')+(on?'✓ ':'')+esc(label)+'</button>';
+  const lbl=t=>'<div style="'+MONO+'font-size:10px;font-weight:600;letter-spacing:.14em;color:#6b7280;margin:20px 0 10px;">'+t+'</div>';
+  const gc=S.genCats||[], gt=S.genTones||[];
+  const cats=chip('genCatSet:',gc.length===0,'Auto — SCOUT picks')
+    +(S.catCatalog||[]).map(c=>chip('genCatSet:'+c.key,gc.includes(c.key),c.label)).join('');
+  const tones=chip('genToneSet:',gt.length===0,'Auto — judged per story')
+    +(S.tonesApi||[]).map(t=>chip('genToneSet:'+t.key,gt.includes(t.key),t.label,TONECOLOR[t.label]||'#9aa3b2')).join('');
+  const mixNote=(gc.length>1||gt.length>1)?'<div style="font-size:12px;color:#5fe0a0;margin-top:10px;line-height:1.5;">✓ Multiple picks — the '+n+' stories will be a random mix across them.</div>':'';
+  return lbl('HOW MANY')
+      +'<div style="display:flex;align-items:center;gap:14px;">'
+        +'<input type="range" data-slider="genN" min="1" max="'+max+'" value="'+n+'" style="flex:1;height:5px;accent-color:#f2b64a;cursor:pointer;">'
+        +'<span id="obGenN" style="'+MONO+'font-size:24px;font-weight:600;color:#f4f6fa;min-width:36px;text-align:center;">'+n+'</span>'
+      +'</div>'
+      +'<div style="font-size:12.5px;color:#7b8291;margin-top:6px;line-height:1.5;">stories this batch (max '+max+'). You\'ll see a live count while they\'re made.</div>'
+      +lbl('WHAT KIND OF STORIES · pick as many as you like')
+      +'<div style="display:flex;flex-wrap:wrap;gap:8px;">'+cats+'</div>'
+      +lbl('TONE · pick as many as you like')
+      +'<div style="display:flex;flex-wrap:wrap;gap:8px;">'+tones+'</div>'
+      +mixNote
+      +'<div style="display:flex;align-items:center;gap:10px;margin-top:26px;">'
+        +'<button data-act="composerClose" class="hvNeu" style="cursor:pointer;font-size:13.5px;font-weight:500;padding:11px 20px;border-radius:20px;border:1px solid #3a4453;background:transparent;color:#9aa3b2;">Cancel</button>'
+        +'<button data-act="generate" id="obGenBtn" class="hvB" style="flex:1;cursor:pointer;font-size:14px;font-weight:600;padding:12px;border-radius:20px;border:0;background:linear-gradient(150deg,#f2b64a,#e0a038);color:#1a1206;box-shadow:0 4px 16px rgba(242,182,74,.2);">⟳ Generate '+n+' stor'+(n!==1?'ies':'y')+'</button>'
+      +'</div>';
+}
+function repaintComposer(){
+  const z=document.getElementById('composerZone');
+  if(!z){ renderApp(); return; }
+  z.innerHTML=composerBody();
+}
+function composerView(){
+  if(!S.composer) return '';
+  return '<div data-act="composerClose" style="position:fixed;inset:0;z-index:120;background:rgba(6,8,11,.82);display:flex;align-items:flex-start;justify-content:center;padding:60px 20px;overflow-y:auto;animation:obFade .15s ease;">'
+    +'<div data-modal style="width:100%;max-width:560px;background:#12161d;border:1px solid #262d38;border-radius:16px;box-shadow:0 30px 80px rgba(0,0,0,.6);overflow:hidden;animation:obUp .22s ease both;">'
+    +'<div style="height:5px;background:linear-gradient(90deg,#f2b64a,#c8842a);"></div>'
+    +'<div style="padding:22px 26px 24px;">'
+      +'<div style="display:flex;align-items:center;gap:10px;">'
+        +'<div style="font-family:\'Spectral\',serif;font-size:23px;font-weight:600;color:#f6f2ea;">Generate stories</div>'
+        +'<button data-act="composerClose" class="hvX" style="margin-left:auto;cursor:pointer;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border:0;border-radius:8px;background:#1a1f28;color:#8b93a2;font-size:16px;">✕</button>'
+      +'</div>'
+      +'<div style="font-size:13px;color:#8b93a2;margin-top:4px;line-height:1.5;">Pick what you want — or leave everything on <strong style="color:#cfd4de;">Auto</strong> and '+esc(S.botName)+' decides. Multiple picks mix randomly across the batch.</div>'
+      +'<div id="composerZone">'+composerBody()+'</div>'
+    +'</div></div></div>';
+}
+
+// ---- root render -----------------------------------------------------------------
+function renderApp(){
+  // don't rip a playing preview out of the DOM mid-watch
+  // A playing preview only blocks BACKGROUND re-renders (a poll must not rip the
+  // video out mid-watch). User clicks still work — previously the whole UI went
+  // dead (every click silently no-oped) until you paused the video.
+  const vids=document.querySelectorAll('video');
+  if(_renderSilent){ for(const v of vids){ if(!v.paused&&!v.ended) return; } }
+  // preserve each video's playback state across the rebuild (matched by src)
+  const vidState={};
+  for(const v of vids){ if(v.currentTime>0) vidState[v.getAttribute('src')]={t:v.currentTime,playing:(!v.paused&&!v.ended)}; }
+  const searchEl=document.activeElement&&document.activeElement.id==='searchIn'?document.activeElement:null;
+  const caret=searchEl?searchEl.selectionStart:null;
+  // keep scroll positions from jumping on poll re-renders — but NOT across a
+  // tab switch (each view starts at the top, no more inherited scroll offset)
+  const viewChanged=S.view!==lastView;
+  const _fl=document.getElementById('feedList'), _fd=document.getElementById('feedDetail'), _ct=document.getElementById('content');
+  const flTop=_fl?_fl.scrollTop:0, fdTop=_fd?_fd.scrollTop:0, ctTop=(viewChanged||!_ct)?0:_ct.scrollTop;
+  // background poll must not disrupt anything you have open (a modal, an editor,
+  // a dropdown), the Production tab's inline Style editor, or an in-progress
+  // click — live data waits until you're idle and looking at a live view.
+  // _bgPending remembers a skipped paint so the fresh data still lands later
+  // (without it the UI could sit stale: the snapshot diff already consumed the
+  // change, so no future poll would repaint).
+  if(_renderSilent&&(S.openDropdown||S.styleStory||S.composer||S.openStory!=null
+      ||S.view==='settings'||(Date.now()-lastTouch<1500))){ _bgPending=true; return; }
+
+  const enriched=S.stories.map(enrich);
+  const newCount=enriched.filter(e=>e.status==='new').length;
+  const approvedCount=enriched.filter(e=>e.status==='approved').length;
+  let feedList=enriched.slice().sort((a,b)=>{const an=a.status==='new',bn=b.status==='new';return an===bn? b.overall-a.overall : (an?-1:1);});
+
+  const titles={feed:['story-feed','Live drafts from '+S.botName+' — approve, pass, or ask for another angle.'],dashboard:['review-board','Filter & sort every draft. All your criteria live in the dropdowns.'],queue:['production-queue','Greenlit stories — renders queue automatically and previews land here.'],rubric:['rating-rubric','The exact criteria '+S.botName+' scores every story against.'],costs:['spend-and-credits','API spend, ElevenLabs credits and when to top up, plus today’s guardrails.'],settings:['settings','Set your production defaults and which story categories get made.']};
+  const t=titles[S.view];
+  const navItem=(key,label,count,gold)=>{
+    const active=S.view===key;
+    return '<button data-act="view:'+key+'" class="hvNav" style="display:flex;align-items:center;gap:9px;width:100%;text-align:left;border:0;cursor:pointer;padding:9px 10px;border-radius:8px;font-size:14px;font-weight:500;margin-bottom:2px;background:'+(active?'rgba(242,182,74,.1)':'transparent')+';color:'+(active?'#f2b64a':'#aeb4c0')+';transition:background .12s,color .12s;">'
+      +'<span style="'+MONO+'font-size:14px;opacity:.7;">#</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+label+'</span>'
+      +(count?'<span style="margin-left:auto;'+MONO+'font-size:11px;font-weight:600;padding:1px 7px;border-radius:20px;background:'+(gold?'rgba(242,182,74,.16)':'rgba(110,168,254,.16)')+';color:'+(gold?'#f2b64a':'#8fbcff')+';">'+count+'</span>':'')
+      +'</button>';
+  };
+  let content='';
+  if(S.view==='feed') content=feedView(feedList);
+  else if(S.view==='dashboard') content=dashboardView(enriched);
+  else if(S.view==='queue') content=queueView(enriched);
+  else if(S.view==='costs') content=costsView();
+  else if(S.view==='settings') content=settingsView();
+  else content=rubricView();
+
+  const appHtml=
+  '<div style="display:flex;height:100vh;width:100%;overflow:hidden;background:#0b0d10;background-image:radial-gradient(1200px 600px at 78% -8%,rgba(242,182,74,.05),transparent 60%),radial-gradient(900px 500px at -5% 108%,rgba(120,140,255,.045),transparent 60%);">'
+  +'<aside style="width:264px;flex-shrink:0;height:100%;display:flex;flex-direction:column;background:#0e1116;border-right:1px solid #1c212b;">'
+    +'<div style="padding:20px 18px 16px;border-bottom:1px solid #1a1f28;"><div style="display:flex;align-items:center;gap:11px;">'
+      +'<div style="width:34px;height:34px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:linear-gradient(150deg,#f2b64a,#c8842a);color:#1a1206;border-radius:9px;'+MONO+'font-weight:600;font-size:17px;box-shadow:0 4px 14px rgba(242,182,74,.22);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);">◆</div>'
+      +'<div style="min-width:0;"><div style="'+MONO+'font-weight:600;font-size:15px;letter-spacing:.22em;color:#f4f6fa;">'+esc(S.workspaceName)+'</div><div style="font-size:11px;color:#6b7280;letter-spacing:.04em;margin-top:1px;">story pipeline</div></div>'
+    +'</div></div>'
+    +(function(){
+       const busy=(S.gen&&S.gen.active)||S.busyGen;
+       const btnLbl=busy?('⟳ '+((S.gen&&S.gen.active&&S.gen.total)?('Generating '+S.gen.done+'/'+S.gen.total):'Generating…')):'⟳ Generate stories';
+       const gc=S.genCats||[], gt=S.genTones||[];
+       const picks=[(S.genCount||3)+' stories',
+         gc.length===0?'any category':(gc.length===1?(((S.catCatalog||[]).find(c=>c.key===gc[0])||{}).label||gc[0]):gc.length+' categories'),
+         gt.length===0?'auto tone':(gt.length===1?((((S.tonesApi||[]).find(t=>t.key===gt[0])||{}).label||'').split(' /')[0].toLowerCase()):gt.length+' tones')];
+       return '<div style="padding:14px 14px 4px;">'
+         +'<button data-act="composer" class="hvB" '+(busy?'disabled':'')+' style="display:flex;align-items:center;justify-content:center;gap:8px;width:100%;border:0;cursor:pointer;padding:11px 12px;border-radius:9px;font-size:13.5px;font-weight:600;color:#1a1206;background:linear-gradient(150deg,#f2b64a,#e0a038);box-shadow:0 4px 16px rgba(242,182,74,.2);transition:filter .12s;'+(busy?'opacity:.7;':'')+'"><span style="'+(busy?'animation:obPulse 1s ease-in-out infinite;':'')+'">'+btnLbl+'</span></button>'
+         +(busy?'':'<div style="'+MONO+'font-size:10px;color:#565d6b;text-align:center;margin-top:7px;letter-spacing:.03em;">'+esc(picks.join(' · '))+'</div>')
+       +'</div>';
+     })()
+    +'<nav style="flex:1;overflow-y:auto;padding:14px 12px;">'
+      +'<div style="'+MONO+'font-size:10.5px;font-weight:600;letter-spacing:.16em;color:#565d6b;padding:0 8px 8px;">PIPELINE</div>'
+      +navItem('feed','story-feed',newCount,false)
+      +navItem('dashboard','review-board',0,false)
+      +navItem('queue','production-queue',approvedCount,true)
+      +'<div style="'+MONO+'font-size:10.5px;font-weight:600;letter-spacing:.16em;color:#565d6b;padding:16px 8px 8px;">REFERENCE</div>'
+      +navItem('rubric','rating-rubric',0,false)
+      +navItem('costs','spend-and-credits',0,false)
+      +navItem('settings','settings',0,false)
+    +'</nav>'
+    +'<div style="margin:12px 14px 16px;padding:12px;border-radius:10px;background:#12161d;border:1px solid #1e2430;"><div style="display:flex;align-items:center;gap:9px;">'
+      +'<div style="position:relative;width:30px;height:30px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:#1c2230;color:#f2b64a;border-radius:8px;'+MONO+'font-weight:600;font-size:13px;">'+esc(S.botName.charAt(0))+'<span style="position:absolute;right:-2px;bottom:-2px;width:11px;height:11px;border-radius:50%;background:#3ecf8e;border:2.5px solid #12161d;"></span></div>'
+      +'<div style="min-width:0;line-height:1.25;"><div style="font-size:13px;font-weight:600;color:#e8eaf0;">'+esc(S.botName)+' <span style="'+MONO+'font-size:9px;font-weight:600;letter-spacing:.06em;color:#1a1206;background:#f2b64a;padding:1px 4px;border-radius:3px;vertical-align:middle;">BOT</span></div>'
+      +'<div style="font-size:11px;color:#3ecf8e;display:flex;align-items:center;gap:5px;"><span style="width:6px;height:6px;border-radius:50%;background:#3ecf8e;animation:obPulse 2s ease-in-out infinite;"></span> online · scanning sources</div></div>'
+    +'</div></div>'
+  +'</aside>'
+  +'<main style="flex:1;min-width:0;display:flex;flex-direction:column;height:100%;">'
+    +'<header style="flex-shrink:0;display:flex;align-items:center;gap:16px;padding:0 24px;height:66px;border-bottom:1px solid #1a1f28;background:#0c0e12;">'
+      +'<div style="min-width:0;"><div style="display:flex;align-items:center;gap:8px;'+MONO+'font-size:16px;font-weight:600;color:#f4f6fa;letter-spacing:.01em;"><span style="color:#4a515f;">#</span>'+t[0]+'</div><div style="font-size:12.5px;color:#7b8291;margin-top:2px;">'+t[1]+'</div></div>'
+      +'<div style="margin-left:auto;display:flex;align-items:center;gap:12px;">'
+        +(S.view==='dashboard'?'<div style="position:relative;display:flex;align-items:center;"><span style="position:absolute;left:11px;color:#5b6270;font-size:13px;pointer-events:none;">⌕</span><input id="searchIn" value="'+esc(S.search)+'" placeholder="Search titles &amp; summaries" class="sIn" style="width:230px;background:#12161d;border:1px solid #232a35;border-radius:8px;color:#e8eaf0;font:inherit;font-size:13px;padding:8px 12px 8px 30px;outline:none;"></div>':'')
+        +'<div style="display:flex;align-items:center;gap:7px;'+MONO+'font-size:11.5px;color:#7b8291;padding:6px 11px;border:1px solid #1e2430;border-radius:8px;background:#0f131a;"><span style="width:7px;height:7px;border-radius:50%;background:#3ecf8e;animation:obPulse 2s ease-in-out infinite;"></span>'+esc(S.botName)+'<span style="color:#4a515f;">/</span>'+enriched.length+' drafts</div>'
+      +'</div>'
+    +'</header>'
+    +'<div id="content" style="'+(S.view==='feed'?'flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;':'flex:1;overflow-y:auto;')+'">'+genPanel()+content+'</div>'
+  +'</main>'
+  +modalView(enriched)
+  +composerView()
+  +styleView()
+  +'</div>';
+
+  // Nothing visible changed? Don't touch the DOM at all — no flicker, no
+  // scroll reset. This is what kills the "it refreshes every time I scroll"
+  // feeling: background polls that produce identical HTML are no-ops.
+  _bgPending=false;
+  if(appHtml===lastAppHtml && !resetDetailScroll){ lastView=S.view; return; }
+  lastAppHtml=appHtml;
+  document.getElementById('app').innerHTML=appHtml;
+  lastView=S.view;
+
+  if(searchEl){ const el=document.getElementById('searchIn'); if(el){ el.focus(); try{el.setSelectionRange(caret,caret);}catch(_){}} }
+  const fl2=document.getElementById('feedList'); if(fl2) fl2.scrollTop=flTop;
+  const fd2=document.getElementById('feedDetail'); if(fd2) fd2.scrollTop=resetDetailScroll?0:fdTop;
+  const ct2=document.getElementById('content'); if(ct2) ct2.scrollTop=ctTop;
+  resetDetailScroll=false;
+  // put each preview video back where it was (rebuild resets them to 0:00);
+  // players are preload="none", so seek once metadata is in
+  for(const v of document.querySelectorAll('video')){
+    const st=vidState[v.getAttribute('src')];
+    if(st){
+      const seek=()=>{ try{ v.currentTime=st.t; if(st.playing) v.play().catch(()=>{}); }catch(_){}};
+      if(v.readyState>=1) seek();
+      else{ v.preload='metadata'; v.addEventListener('loadedmetadata',seek,{once:true}); }
+    }
+  }
+}
+
+// ---- events -------------------------------------------------------------------------
+document.addEventListener('click',e=>{
+  const el=e.target.closest('[data-act]');
+  if(!el){
+    if(S.openDropdown&&!(e.target.closest&&e.target.closest('[data-dropdown]'))){ S.openDropdown=null; renderApp(); }
+    return;
+  }
+  if(el.hasAttribute('disabled')) return;
+  const parts=el.getAttribute('data-act').split(':');
+  const a=parts[0], arg=parts[1], arg2=parts.slice(2).join(':');
+  // clicking the modal backdrop closes; clicks inside the modal shouldn't
+  if(a==='closeModal'&&e.target.closest('[data-modal]')&&!e.target.closest('button')) return;
+  switch(a){
+    case 'view': S.view=arg; S.openDropdown=null; renderApp(); if(arg==='costs') pollCosts(); break;
+    case 'generate': generateBatch(); break;
+    case 'approve': { const st=S.stories.find(s=>s.id===parseInt(arg)); if(st&&st.status!=='approved'&&st.status!=='shipped'){ st.status='approved'; st.job={state:'queued',error:null}; toast('Greenlit — queued for render…'); renderApp(); } act(arg,'approve'); break; }
+    case 'composer': S.composer=true; renderApp(); break;
+    case 'composerClose': if(e.target.closest('[data-modal]')&&!e.target.closest('button')) return; S.composer=false; renderApp(); break;
+    case 'genCatSet': { if(!arg) S.genCats=[]; else { const a=S.genCats||[]; S.genCats=a.includes(arg)?a.filter(k=>k!==arg):a.concat([arg]); } repaintComposer(); break; }
+    case 'genToneSet': { if(!arg) S.genTones=[]; else { const a=S.genTones||[]; S.genTones=a.includes(arg)?a.filter(k=>k!==arg):a.concat([arg]); } repaintComposer(); break; }
+    case 'select': S.selStory=parseInt(arg); resetDetailScroll=true; S.openDropdown=null; renderApp(); break;
+    case 'dismiss': act(arg,'reject'); break;
+    case 'feedStatus': S.feedStatus=arg; S.openDropdown=null; renderApp(); break;
+    case 'feedClear': S.feedStatus='all'; S.feedCat='all'; S.feedTone='all'; S.feedSort='newest'; S.openDropdown=null; renderApp(); break;
+    case 'stage': { const rd=(S.settings&&S.settings.render)||{}; const cur=rd[arg]!==false; saveSettings({render:{[arg]:!cur}}); break; }
+    case 'capDec': saveSettings({maxRenders:Math.max(0,(((S.settings&&S.settings.maxRenders)!=null)?S.settings.maxRenders:5)-1)}); break;
+    case 'capInc': saveSettings({maxRenders:Math.min(9999,(((S.settings&&S.settings.maxRenders)!=null)?S.settings.maxRenders:5)+1)}); break;
+    case 'dtDec': saveSettings({dailyTarget:Math.max(0,(((S.settings&&S.settings.dailyTarget)!=null)?S.settings.dailyTarget:12)-1)}); break;
+    case 'dtInc': saveSettings({dailyTarget:Math.min(9999,(((S.settings&&S.settings.dailyTarget)!=null)?S.settings.dailyTarget:12)+1)}); break;
+    case 'autogenToggle': saveSettings({autogen:!(S.settings&&S.settings.autogen)}); break;
+    case 'cat': toggleCat(arg); break;
+    case 'opt': setOpt(parseInt(arg),arg2); break;
+    case 'style': openStyle(parseInt(arg)); break;
+    case 'styleClose': if(e.target.closest('[data-modal]')&&!e.target.closest('button')&&!e.target.closest('label')) return; stopPreview(); S.styleStory=null; renderApp(); break;
+    case 'styleRender': styleRender(); break;
+    case 'capToggle': setStage({captions:!tgtStage('captions')}); break;
+    case 'musToggle': setStage({music:!tgtStage('music')}); break;
+    case 'capUpper': setCap({upper:!tgtCap().upper}); break;
+    case 'capFont': setCap({font:decodeURIComponent(arg)}); break;
+    case 'capColor': setCap({color:decodeURIComponent(arg)}); break;
+    case 'capSize': setCap({size:arg}); break;
+    case 'capWords': setCap({words:parseInt(arg)}); break;
+    case 'capAnim': setCap({anim:arg}); break;
+    case 'capPos': setCap({pos:arg}); break;
+    case 'capTrack': setStage({music_track:arg?decodeURIComponent(arg):''}); break;
+    case 'voiceSet': setStage({voice:arg||''}); break;
+    case 'voicePlay': playVoice(arg); break;
+    case 'musicPlay': playMusic(decodeURIComponent(arg),decodeURIComponent(arg2)); break;
+    case 'reject': S.openStory=null; act(arg,'reject'); break;
+    case 'regen': regen(parseInt(arg)); break;
+    case 'sendback': act(arg,'send_back'); break;
+    case 'renderNow': renderAct(parseInt(arg),'render','Queued — starting render…'); break;
+    case 'reroll': renderAct(parseInt(arg),'reroll','Re-rolling footage — re-rendering…'); break;
+    case 'revoice': openStyle(parseInt(arg)); break;   // pick a new voice, then it re-renders
+    case 'ship': act(arg,'ship'); break;
+    case 'details': S.openStory=parseInt(arg); S.modalTab='overview'; S.openDropdown=null; renderApp(); break;
+    case 'footage': S.openStory=parseInt(arg); S.modalTab='script'; S.openDropdown=null; renderApp(); break;
+    case 'closeModal': S.openStory=null; renderApp(); break;
+    case 'tabOverview': S.modalTab='overview'; renderApp(); break;
+    case 'tabScript': S.modalTab='script'; renderApp(); break;
+    case 'toneToggle': S.openDropdown=S.openDropdown===('tone:'+arg)?null:('tone:'+arg); renderApp(); break;
+    case 'toneSet': { S.openDropdown=null; const tk=toneKeyOf(arg2); if(tk) act(arg,'tone',{tone:tk}); break; }
+    case 'ddToggle': S.openDropdown=S.openDropdown===arg?null:arg; renderApp(); break;
+    case 'ddSet': { const key=arg, val=arg2; if(key==='sortBy') S.sortBy=val; else S[key]=val; S.openDropdown=null; renderApp(); break; }
+    case 'clear': S.filterRating='all'; S.filterStatus='all'; S.filterCategory='all'; S.filterTone='all'; S.search=''; S.openDropdown=null; renderApp(); break;
+  }
+});
+document.addEventListener('input',e=>{
+  if(e.target.id==='searchIn'){ S.search=e.target.value; renderApp(); return; }
+  const sl=e.target.dataset&&e.target.dataset.slider;
+  if(sl==='genN'){   // composer count: pure DOM update, no repaint — smooth drag
+    const v=+e.target.value; S.genCount=v;
+    const l=document.getElementById('obGenN'); if(l) l.textContent=v;
+    const b=document.getElementById('obGenBtn'); if(b) b.textContent='⟳ Generate '+v+' stor'+(v!==1?'ies':'y');
+    return;
+  }
+  const t=sl&&styleTarget();
+  if(t){                 // live: update the target cap + preview DOM, NO re-render (smooth drag)
+    const v=+e.target.value;
+    if(t.kind==='story'){ t.e.opts=Object.assign({},t.e.opts,{cap:Object.assign({},storyCap(t.e),{[sl]:v})}); }
+    else { S.settings=S.settings||{}; S.settings.render=Object.assign({},S.settings.render,{cap:Object.assign({},globalCap(),{[sl]:v})}); }
+    if(sl==='pos'){ const el=document.getElementById('obPvText'); if(el) el.style.top=v+'%'; }
+    else if(sl==='bg'){ const b=document.getElementById('obPvBg'); if(b) b.style.opacity=v/100; const l=document.getElementById('obBgLbl'); if(l) l.textContent=(v===0?'Fully transparent — captions float on your own footage':v+'% dark backdrop'); }
+    else if(sl==='size'){ const el=document.getElementById('obPvText'); if(el) el.style.fontSize=Math.round(v*0.207)+'px'; const l=document.getElementById('obSzLbl'); if(l) l.textContent=v+'px'; }
+  }
+});
+document.addEventListener('change',e=>{
+  if(e.target.matches&&e.target.matches('[data-fontup]')) uploadFont(e.target);
+  else if(e.target.matches&&e.target.matches('[data-musicup]')){ const lab=e.target.closest('[data-musicfolder]'); uploadMusic(lab?lab.dataset.musicfolder:'any',e.target); }
+  else{ const sl=e.target.dataset&&e.target.dataset.slider;
+    if(sl==='genN') return;                        // count already applied live
+    const t=sl&&styleTarget();
+    if(t){ const v=+e.target.value;
+      if(t.kind==='story') saveOptSilent(t.e.id,{cap:{[sl]:v}}); else saveSettings({render:{cap:{[sl]:v}}},true);
+      toast({pos:'Position saved',bg:'Transparency saved',size:'Size saved'}[sl]||'Saved'); } }   // auto-save on release (no re-render — DOM already live)
+});
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ stopPreview(); S.openStory=null; S.openDropdown=null; S.composer=false; S.styleStory=null; renderApp(); } });
+
+// ---- boot ----------------------------------------------------------------------------
+// One self-scheduling tick: always poll the cheap /api/gen; poll /api/state fast
+// while anything is live (generating or a render in flight), slow otherwise; and
+// refresh the Costs tab while it's open.
+let sinceCosts=0;
+async function tick(){
+  if(document.hidden){ setTimeout(tick,4000); return; }
+  await pollGen();
+  const anyActive=(S.gen&&S.gen.active)||S.stories.some(s=>s.job&&['queued','tts','clips','assembling','preview'].includes(s.job.state));
+  await refresh(false);
+  if(S.view==='costs'&&(++sinceCosts>=3)){ sinceCosts=0; await pollCosts(); }
+  if(_bgPending) bgRender();      // deliver a paint that was deferred mid-edit
+  setTimeout(tick, anyActive?1400:4000);
+}
+refresh(true).then(tick);
+</script>
+</body>
+</html>

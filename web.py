@@ -1,0 +1,961 @@
+"""
+web.py -- the OBSCURA web console: aiohttp backend + the webui/ single-page
+app (a faithful port of the original Story Bot artifact design, wired to the
+real pipeline).
+
+Runs two ways:
+  * embedded in the bot process (story_bot calls start() with hooks so web
+    actions also update the Discord feed cards / post new drafts there), or
+  * standalone: `.venv/bin/python web.py` -- browse, approve, generate and
+    queue renders with no Discord at all. Queued jobs are DB rows; the bot's
+    polling worker picks them up whenever it runs.
+
+Auth: bind to 127.0.0.1 by default (expose via a cloudflared route +
+Cloudflare Access like helm). Optionally set STORY_WEB_SECRET -- then every
+request needs ?key=<secret> once (a cookie keeps the session).
+"""
+
+import asyncio
+import json
+import math
+import os
+import random
+import re
+import subprocess
+import time
+
+from aiohttp import web as aioweb
+
+import assemble
+import captions
+import criteria
+import render
+import store
+import voice
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+WEBUI = os.path.join(BASE, "webui")
+MUSIC_DIR = os.path.join(BASE, "music")
+# curated system fonts that read well as big captions (+ any uploaded ones)
+CURATED_FONTS = ["Liberation Sans", "Liberation Sans Narrow",
+                 "Liberation Serif", "DejaVu Sans", "DejaVu Serif",
+                 "FreeSans", "FreeSerif"]
+_SAFE = re.compile(r"[^A-Za-z0-9._ -]+")
+
+
+def _safe_name(name: str, default: str) -> str:
+    name = _SAFE.sub("_", os.path.basename(name or "")).strip() or default
+    return name[:80]
+
+
+WEB_ENABLED = os.environ.get("STORY_WEB", "1") == "1"
+HOST = os.environ.get("STORY_WEB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("STORY_WEB_PORT", "8377"))
+SECRET = os.environ.get("STORY_WEB_SECRET", "")
+BOT_NAME = os.environ.get("STORY_BOT_NAME", "SCOUT")
+WORKSPACE = os.environ.get("STORY_WORKSPACE", "OBSCURA")
+
+# ---- generation volume + per-click ceiling ---------------------------------------------
+# A batch = one web_search-grounded research call + judging + shot-writing; only
+# Anthropic cost, no render/ElevenLabs spend (that stays capped + approval-gated).
+DAILY_TARGET = int(os.environ.get("STORY_DAILY_TARGET", "12"))   # drafts/day
+GEN_BATCH = max(1, int(os.environ.get("STORY_GEN_BATCH", "3")))  # per-batch size
+MAX_GEN = max(1, int(os.environ.get("STORY_MAX_GEN", "10")))     # per-click ceiling
+AUTOGEN = os.environ.get("STORY_WEB_AUTOGEN", "1") == "1"        # standalone only
+MAX_RENDERS = int(os.environ.get("STORY_MAX_RENDERS_PER_DAY", "5"))
+
+# ---- estimated API pricing (USD; env-overridable — the Costs tab labels it an estimate).
+# sonnet-5 intro rates $2/$10 per 1M run through 2026-08-31, then $3/$15.
+PRICE_IN_MAIN = float(os.environ.get("STORY_PRICE_IN_MAIN", "2.00"))
+PRICE_OUT_MAIN = float(os.environ.get("STORY_PRICE_OUT_MAIN", "10.00"))
+PRICE_IN_FAST = float(os.environ.get("STORY_PRICE_IN_FAST", "1.00"))    # haiku-4.5
+PRICE_OUT_FAST = float(os.environ.get("STORY_PRICE_OUT_FAST", "5.00"))
+PRICE_WEBSEARCH = float(os.environ.get("STORY_PRICE_WEBSEARCH", "10.00"))  # per 1k
+
+# ---- live generation state (single job at a time; the SPA polls /api/gen) ---------------
+_GEN = {"active": False, "kind": None, "phase": "idle", "done": 0, "total": 0,
+        "label": "", "error": None, "posted": 0}
+
+
+def _gen_progress(phase, done, total, label):
+    _GEN.update(phase=phase, done=done, total=total, label=label)
+
+
+# ---- brief / export text (shared with the Discord bot) --------------------------------
+
+def envato_url(kw: str) -> str:
+    import urllib.parse
+    slug = urllib.parse.quote_plus(kw.strip().lower())
+    return f"https://elements.envato.com/stock-video/{slug}?orientation=vertical"
+
+
+def brief_text(s: dict) -> str:
+    ov = criteria.overall(s["scores"])
+    tone = criteria.TONES.get(s["tone"], criteria.TONES["documentary"])
+    cat = criteria.CATEGORIES.get(s["category"], {})
+    L = [f"# {s['title']}", "",
+         f"Category: {cat.get('label', '?')}  |  Suggested tone: "
+         f"{tone['label']}  |  Rating: {ov:.1f}/5", ""]
+    if s.get("sources"):
+        L += [f"> Based on a true story: {s['sources'][0]}", ""]
+    L += ["## Hook", s["hook"], "", "## Summary", s["summary"], ""]
+    if s.get("yt_titles"):
+        L += ["## Suggested YouTube titles"]
+        L += [f"- {t}" for t in s["yt_titles"]]
+        L += [""]
+    clips = {c["beat_idx"]: c for c in store.clips_for_story(s["id"])}
+    if s.get("beats"):
+        L += ["## Script & footage shot list", ""]
+        for i, b in enumerate(s["beats"]):
+            L += [f"### Shot {i + 1:02d}", f"Narration: {b['n']}",
+                  f"On screen: {b['v']}", "Stock footage:"]
+            L += [f"- {k}  ->  {envato_url(k)}" for k in b["k"]]
+            if i in clips and clips[i].get("url"):
+                L += [f"- CHOSEN: {clips[i]['source']} {clips[i]['url']}"]
+            L += [""]
+    L += ["---", f"Generated by {BOT_NAME} / {WORKSPACE} story pipeline"]
+    return "\n".join(L)
+
+
+def script_text(s: dict) -> str:
+    L = [f"{s['title']} — narration script", ""]
+    for i, b in enumerate(s.get("beats", [])):
+        L.append(f"{i + 1}. {b['n']}")
+    L += ["", f"({len(s.get('beats', []))} beats · {BOT_NAME})"]
+    return "\n".join(L)
+
+
+def export_all_text(stories: list[dict]) -> str:
+    body = "\n\n\n".join(brief_text(s) for s in stories)
+    return f"# Production queue — {len(stories)} briefs\n\n" + body
+
+
+# ---- state snapshot ---------------------------------------------------------------------
+
+def _render_info(story_id: int) -> dict:
+    d = os.path.join(render.RENDERS, str(story_id))
+    info = {"master": False, "master_url": None, "preview": None,
+            "duration": None, "alpha": None}
+
+    def _v(path: str) -> int:
+        # cache-buster: re-renders reuse the SAME filename (preview_1280.mp4,
+        # master_alpha.mov), so without a version the browser serves the stale
+        # cached video/download and the style change looks like it "did nothing".
+        try:
+            return int(os.path.getmtime(path))
+        except OSError:
+            return 0
+
+    mp4 = os.path.join(d, "master.mp4")
+    if os.path.exists(mp4):
+        info["master"] = True
+        # full-resolution 1080x1920 download (the preview player is a downscaled
+        # 720-wide proxy for fast in-browser playback; this is the real file).
+        info["master_url"] = f"/renders/{story_id}/master.mp4?v={_v(mp4)}"
+    apath = os.path.join(d, "master_alpha.mov")
+    if os.path.exists(apath):
+        info["alpha"] = f"/renders/{story_id}/master_alpha.mov?v={_v(apath)}"
+    if os.path.isdir(d):
+        for f in sorted(os.listdir(d)):
+            if f.startswith("preview_") and f.endswith(".mp4"):
+                info["preview"] = f"/renders/{story_id}/{f}?v={_v(os.path.join(d, f))}"
+                break
+    mpath = os.path.join(d, "manifest.json")
+    if os.path.exists(mpath):
+        try:
+            with open(mpath) as f:
+                info["duration"] = json.load(f).get("duration")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return info
+
+
+def _snapshot() -> dict:
+    """Blocking: everything the SPA needs, in the shape its enrich() expects."""
+    stories = store.list_stories(limit=300)
+    jobs = {}
+    for j in store.jobs_in_flight():
+        jobs[j["story_id"]] = {"state": j["state"], "error": j["error"]}
+    # terminal states of each story's LATEST job matter too (blocked/failed)
+    out = []
+    for s in stories:
+        cat = criteria.CATEGORIES.get(s["category"], {})
+        tone = criteria.TONES.get(s["tone"], criteria.TONES["documentary"])
+        job = jobs.get(s["id"])
+        if job is None:
+            last = store.active_job_for_story(s["id"])  # blocked is non-terminal
+            if last:
+                job = {"state": last["state"], "error": last["error"]}
+        ri = _render_info(s["id"]) if s["status"] in ("approved", "shipped") \
+            else None
+        out.append({
+            "id": s["id"], "title": s["title"],
+            "cat": cat.get("label", s["category"]), "catKey": s["category"],
+            "tone": tone["label"], "toneKey": s["tone"],
+            "status": s["status"], "scores": s["scores"],
+            "hook": s["hook"], "summary": s["summary"],
+            "yt": s["yt_titles"] or [], "sources": s["sources"] or [],
+            "source": (s["sources"] or [""])[0],
+            "script": s["beats"] or [],
+            "clips": [{"beat_idx": c["beat_idx"], "source": c["source"],
+                       "url": c["url"]}
+                      for c in store.clips_for_story(s["id"])]
+            if s["status"] in ("approved", "shipped") else [],
+            "created": s["created_at"],
+            "job": job, "render": ri,
+            "opts": store.render_opts(s["id"])
+            if s["status"] in ("approved", "shipped") else None,
+        })
+    return {
+        "botName": BOT_NAME, "workspaceName": WORKSPACE,
+        "threshold": criteria.APPROVAL_THRESHOLD,
+        "cats": criteria.CATEGORY_LABELS,
+        "tones": [{"key": k, "label": v["label"]}
+                  for k, v in criteria.TONES.items()],
+        "stories": out,
+        "gen": dict(_GEN),
+        "genMax": MAX_GEN, "genDefault": GEN_BATCH,
+        "settings": {"render": store.render_defaults(),
+                     "categories": store.gen_categories(),
+                     "maxRenders": store.render_cap(),
+                     "dailyTarget": store.daily_target(),
+                     "autogen": store.autogen_on()},
+        "catCatalog": [{"key": k, "label": criteria.CATEGORIES[k]["label"]}
+                       for k in criteria.CATEGORY_KEYS],
+    }
+
+
+# ---- costs / usage snapshot -------------------------------------------------------------
+
+def _costs_sync() -> dict:
+    """Blocking: everything the Costs tab shows -- ElevenLabs credits + reset,
+    estimated Anthropic spend this month (from tracked token usage), Pexels
+    calls this hour, renders today. All dollar figures are ESTIMATES."""
+    mon = time.strftime("%Y-%m")
+    day = time.strftime("%Y-%m-%d")
+    hour = time.strftime("%Y-%m-%d-%H")
+
+    in_main = store.budget(f"anthropic_in_main:{mon}")
+    out_main = store.budget(f"anthropic_out_main:{mon}")
+    in_fast = store.budget(f"anthropic_in_fast:{mon}")
+    out_fast = store.budget(f"anthropic_out_fast:{mon}")
+    searches = store.budget("anthropic_websearch:" + mon)
+    anthro_cost = (in_main / 1e6 * PRICE_IN_MAIN
+                   + out_main / 1e6 * PRICE_OUT_MAIN
+                   + in_fast / 1e6 * PRICE_IN_FAST
+                   + out_fast / 1e6 * PRICE_OUT_FAST
+                   + searches / 1000.0 * PRICE_WEBSEARCH)
+
+    # ElevenLabs live credit read (None if the key is TTS-only / absent)
+    el = {"used": None, "limit": None, "reset": None, "ok": False}
+    try:
+        st = voice.eleven_status()
+        if st:
+            el = {"used": st.get("used"), "limit": st.get("limit"),
+                  "reset": st.get("reset_unix"), "tier": st.get("tier"),
+                  "ok": True}
+    except Exception as e:
+        el["error"] = str(e)[:120]
+
+    return {
+        "month": mon,
+        "anthropic": {
+            "estUsd": round(anthro_cost, 2),
+            "inMain": in_main, "outMain": out_main,
+            "inFast": in_fast, "outFast": out_fast,
+            "searches": searches,
+            "priceInMain": PRICE_IN_MAIN, "priceOutMain": PRICE_OUT_MAIN,
+            "priceSearch": PRICE_WEBSEARCH,
+        },
+        "eleven": el,
+        "renders": {"today": store.budget("renders:" + day),
+                    "cap": store.render_cap()},
+        "pexels": {"hour": store.budget("pexels_hr:" + hour), "cap": 190},
+        "daily": {"made": store.budget("autogen:" + day),
+                  "target": store.daily_target(),
+                  "batch": GEN_BATCH, "autogen": store.autogen_on()},
+    }
+
+
+# ---- sync action cores (run via to_thread) ------------------------------------------------
+
+def _queue_render_sync(story_id: int, keep_voice: bool = False) -> str:
+    story = store.get_story(story_id)
+    if not story:
+        return f"no story #{story_id}"
+    if story["status"] != "approved":
+        return f"#{story_id} isn't greenlit"
+    active = store.active_job_for_story(story_id)
+    if active and active["state"] != "blocked":
+        return f"#{story_id} already has a render in flight"
+    if active:
+        store.update_job(active["id"], state="scrapped", error="superseded")
+    if not story.get("beats"):
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return "no script yet and no ANTHROPIC_API_KEY to write one"
+        import llm
+        shots = llm.write_shots(story)
+        store.update_story(story_id, beats=shots["beats"],
+                           yt_titles=shots["yt_titles"])
+    store.create_job(story_id, keep_voice)
+    return f"render queued for #{story_id}"
+
+
+# ---- background generation (single job; the SPA polls /api/gen for progress) ------------
+
+async def _run_gen(app, cat, n, kind, story_id=None, tone=None):
+    """Run generation off the request path, updating _GEN so the console can
+    draw a live loading bar. kind: 'manual' | 'regen' | 'auto'.
+
+    `cat`/`tone` may each be a single key, None, or a LIST of keys — a list
+    means every story in the batch gets a random pick from it (the composer's
+    multi-select), grouped into (cat, tone) chunks so each chunk is one
+    gen_batch research pass."""
+    if _GEN["active"]:
+        return
+    _GEN.update(active=True, kind=kind, phase="research", done=0, total=n,
+                label="Starting…", error=None, posted=0)
+    import llm
+    try:
+        if kind == "regen" and story_id is not None:
+            await asyncio.to_thread(store.update_story, story_id,
+                                    status="rejected")
+        cats = cat if isinstance(cat, list) else ([cat] if cat else [])
+        tones = tone if isinstance(tone, list) else ([tone] if tone else [])
+        if len(cats) > 1 or len(tones) > 1:
+            # per-story random assignment, then group same picks together
+            picks = [(random.choice(cats) if cats else None,
+                      random.choice(tones) if tones else None)
+                     for _ in range(n)]
+            chunks: dict = {}
+            for pair in picks:
+                chunks[pair] = chunks.get(pair, 0) + 1
+        else:
+            chunks = {((cats[0] if cats else None),
+                       (tones[0] if tones else None)): n}
+        stories, base, last_err = [], 0, None
+        for (c, t), cnt in chunks.items():
+            def prog(phase, done, total, label, _b=base):
+                # chunk-local progress -> batch-wide bar
+                _gen_progress(phase, min(_b + done, n), n, label)
+            try:
+                got = await asyncio.to_thread(llm.gen_batch, c, cnt, prog, t)
+                stories += got or []
+            except Exception as e:          # one bad chunk shouldn't kill the rest
+                last_err = e
+                print(f"[web] gen chunk ({c},{t}) failed: {e!r}", flush=True)
+            base += cnt
+        if not stories and last_err is not None:
+            raise last_err
+        if stories:
+            _GEN["posted"] = len(stories)
+            hook = (app.get("hooks") or {}).get("post_drafts")
+            if hook:
+                try:
+                    await hook(stories, kind != "regen")
+                except Exception as e:
+                    print(f"[web] post_drafts hook failed: {e!r}", flush=True)
+            if kind == "auto":
+                await asyncio.to_thread(store.bump,
+                                        "autogen:" + time.strftime("%Y-%m-%d"),
+                                        len(stories))
+        else:
+            _GEN["error"] = _GEN.get("label") or "the generator came back empty"
+    except Exception as e:
+        _GEN["error"] = str(e)[:300]
+        print(f"[web] generation failed: {e!r}", flush=True)
+    finally:
+        _GEN.update(active=False, phase="done")
+
+
+# ---- standalone background tasks (only when web.py runs WITHOUT the bot) -----------------
+
+async def _autogen_loop(app):
+    """Optional auto-generation. **Off by default** — the user clicks Generate.
+    When toggled on (Settings), drafts through the day at the daily target
+    (0 = unlimited → ~hourly). The loop always runs so the toggle takes effect
+    live; it just idles while off. Standalone only (bot has its own scheduler)."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    await asyncio.sleep(30)                       # let startup settle
+    while True:
+        interval = 60                             # default poll while idle/off
+        try:
+            if await asyncio.to_thread(store.autogen_on):
+                target = await asyncio.to_thread(store.daily_target)
+                made = await asyncio.to_thread(
+                    store.budget, "autogen:" + time.strftime("%Y-%m-%d"))
+                if not _GEN["active"] and (target == 0 or made < target):
+                    n = GEN_BATCH if target == 0 \
+                        else min(GEN_BATCH, target - made)
+                    await _run_gen(app, None, n, "auto")
+                batches = math.ceil(target / GEN_BATCH) if target > 0 else 24
+                interval = max(600, int(24 * 3600 / max(1, batches)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[autogen] {e!r}", flush=True)
+        await asyncio.sleep(interval)
+
+
+async def _render_worker(app):
+    """DB-polling render worker for the standalone console, so approved stories
+    actually render (footage/narration/assembly) with no Discord. The bot runs
+    its own worker -- disable storyweb before enabling the bot to avoid two."""
+    await asyncio.sleep(5)
+    print("[web-worker] standalone render worker up", flush=True)
+    while True:
+        job = None
+        try:
+            job = await asyncio.to_thread(store.next_queued_job)
+            if not job:
+                await asyncio.sleep(3)
+                continue
+            await _run_render(job["id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            jid = job["id"] if job else "?"
+            print(f"[web-worker] job {jid} errored: {e!r}", flush=True)
+            if job:
+                try:
+                    await asyncio.to_thread(store.update_job, job["id"],
+                                            state="failed", error=repr(e)[:500])
+                except Exception:
+                    pass
+            await asyncio.sleep(3)
+
+
+async def _run_render(job_id: int):
+    job = await asyncio.to_thread(store.get_job, job_id)
+    if not job or job["state"] in ("done", "failed", "scrapped"):
+        return
+    story = await asyncio.to_thread(store.get_story, job["story_id"])
+    if not story or story["status"] != "approved":
+        await asyncio.to_thread(store.update_job, job_id, state="scrapped",
+                                error="story no longer approved")
+        return
+    master = os.path.join(render.RENDERS, str(story["id"]), "master.mp4")
+    master_exists = await asyncio.to_thread(os.path.exists, master)
+    cap = await asyncio.to_thread(store.render_cap)      # 0 = unlimited
+    if not master_exists and cap and \
+            await asyncio.to_thread(store.renders_today) >= cap:
+        await asyncio.to_thread(store.update_job, job_id, state="blocked",
+                                error="daily render cap reached — raise it or "
+                                      "set it to Off in Settings")
+        return
+
+    def notify(stage):
+        store.update_job(job_id, state=stage)     # sync sqlite, worker thread
+
+    try:
+        await asyncio.to_thread(render.run_job, job, story, notify,
+                                10 * 1024 * 1024)
+    except render.BlockedError as e:
+        await asyncio.to_thread(store.update_job, job_id, state="blocked",
+                                error=str(e)[:500])
+        return
+    except Exception as e:
+        await asyncio.to_thread(store.update_job, job_id, state="failed",
+                                error=repr(e)[:500])
+        return
+    await asyncio.to_thread(store.update_job, job_id, state="done")
+
+
+# ---- handlers ------------------------------------------------------------------------------
+
+async def _call_hook(request, name, *args):
+    hook = (request.app.get("hooks") or {}).get(name)
+    if hook:
+        try:
+            await hook(*args)
+        except Exception as e:
+            print(f"[web] hook {name} failed: {e!r}", flush=True)
+
+
+async def h_state(request):
+    return aioweb.json_response(await asyncio.to_thread(_snapshot))
+
+
+async def h_action(request):
+    sid = int(request.match_info["id"])
+    body = await request.json()
+    action = body.get("action", "")
+    story = await asyncio.to_thread(store.get_story, sid)
+    if not story:
+        return aioweb.json_response({"ok": False, "msg": "story not found"},
+                                    status=404)
+    msg = "done"
+    refresh = True
+    if action == "approve":
+        await asyncio.to_thread(store.update_story, sid, status="approved")
+        msg = await asyncio.to_thread(_queue_render_sync, sid)
+        msg = "Greenlit — " + msg
+    elif action == "reject":
+        await asyncio.to_thread(store.update_story, sid, status="rejected")
+        msg = "Passed — removed from the queue"
+    elif action == "send_back":
+        await asyncio.to_thread(store.update_story, sid, status="new")
+        msg = "Sent back to the feed"
+    elif action == "tone":
+        tk = body.get("tone", "")
+        if tk not in criteria.TONES:
+            return aioweb.json_response({"ok": False, "msg": "bad tone"},
+                                        status=400)
+        await asyncio.to_thread(store.update_story, sid, tone=tk)
+        msg = f"tone → {criteria.TONES[tk]['label']}"
+    elif action == "render":
+        msg = await asyncio.to_thread(_queue_render_sync, sid)
+        refresh = False
+    elif action in ("reroll", "revoice"):
+        # greenlit check BEFORE the destructive reset (mirrors the Discord
+        # handler) -- otherwise a reroll on a shipped/rejected story deletes
+        # its master before _queue_render_sync bounces it.
+        if story["status"] != "approved":
+            return aioweb.json_response(
+                {"ok": False, "msg": f"#{sid} isn't greenlit — re-approve it "
+                 "first (leaves the existing master untouched)"})
+        active = await asyncio.to_thread(store.active_job_for_story, sid)
+        if active and active["state"] != "blocked":
+            return aioweb.json_response(
+                {"ok": False,
+                 "msg": "a render is in flight — let it finish first"})
+        if action == "reroll":
+            await asyncio.to_thread(render.reset_downstream, sid)
+        else:
+            await asyncio.to_thread(render.reset_voice, sid)
+        msg = await asyncio.to_thread(_queue_render_sync, sid,
+                                      action == "reroll")
+        refresh = False
+    elif action == "ship":
+        active = await asyncio.to_thread(store.active_job_for_story, sid)
+        if active and active["state"] != "blocked":
+            return aioweb.json_response(
+                {"ok": False,
+                 "msg": "a render is in flight — let it finish before shipping"})
+        master = os.path.join(render.RENDERS, str(sid), "master.mp4")
+        if not await asyncio.to_thread(os.path.exists, master):
+            return aioweb.json_response(
+                {"ok": False, "msg": f"#{sid} has no finished master to ship "
+                 "(was it re-rolled?)"})
+        await asyncio.to_thread(store.update_story, sid, status="shipped")
+        msg = "Shipped — credits.txt is ready for the YouTube description"
+    elif action == "opts":
+        # Save production settings (footage/music/captions, caption `cap` style,
+        # voice, music_track). `render:true` also (re-)renders NOW with the
+        # current settings -- always, whether or not a master exists yet.
+        payload = body.get("opts") or {}
+        if payload:
+            await asyncio.to_thread(store.set_render_opts, sid, payload)
+        if not body.get("render"):
+            msg = "Saved"
+            refresh = False
+        else:
+            active = await asyncio.to_thread(store.active_job_for_story, sid)
+            if active and active["state"] != "blocked":
+                msg = "A render's already running — your changes apply next time"
+            else:
+                if story["status"] == "shipped":   # un-ship so it re-renders
+                    await asyncio.to_thread(store.update_story, sid,
+                                            status="approved")
+                elif story["status"] != "approved":
+                    await asyncio.to_thread(store.update_story, sid,
+                                            status="approved")
+                master = os.path.join(render.RENDERS, str(sid), "master.mp4")
+                if await asyncio.to_thread(os.path.exists, master):
+                    # least work that reflects the change vs what was rendered
+                    cur = await asyncio.to_thread(store.render_opts, sid)
+                    last = await asyncio.to_thread(
+                        store.kv_get, f"rendered_opts:{sid}", {}) or {}
+                    if cur.get("voice") != last.get("voice"):
+                        await asyncio.to_thread(render.reset_voice, sid)
+                    elif cur.get("footage") != last.get("footage"):
+                        await asyncio.to_thread(render.reset_downstream, sid)
+                    else:
+                        await asyncio.to_thread(render.reset_assembly, sid)
+                q = await asyncio.to_thread(_queue_render_sync, sid, True)
+                msg = "Rendering with your changes…" \
+                    if "queued" in q else q
+            refresh = False
+    elif action == "regen":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return aioweb.json_response(
+                {"ok": False, "msg": "no ANTHROPIC_API_KEY on the server"})
+        if _GEN["active"]:
+            return aioweb.json_response(
+                {"ok": False, "msg": "already generating — one at a time"})
+        # background so the console shows a live loading bar (the story is
+        # rejected inside _run_gen, before the new angle is drafted)
+        asyncio.create_task(
+            _run_gen(request.app, story["category"], 1, "regen", sid))
+        return aioweb.json_response(
+            {"ok": True, "started": True,
+             "msg": f"{BOT_NAME} is drafting a new angle…"})
+    else:
+        return aioweb.json_response({"ok": False, "msg": "unknown action"},
+                                    status=400)
+    if refresh:
+        await _call_hook(request, "refresh_card", sid)
+    return aioweb.json_response({"ok": True, "msg": msg})
+
+
+async def h_generate(request):
+    body = await request.json()
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return aioweb.json_response(
+            {"ok": False, "msg": "no ANTHROPIC_API_KEY on the server"})
+    if _GEN["active"]:
+        return aioweb.json_response(
+            {"ok": False, "msg": f"already generating ({_GEN['done']}/"
+                                 f"{_GEN['total']}) — let it finish"})
+    # multi-select (composer): lists of category/tone keys — each story in the
+    # batch gets a random pick. Single `category`/`tone` kept for back-compat.
+    cats = [c for c in (body.get("cats") or []) if c in criteria.CATEGORIES]
+    tones = [t for t in (body.get("tones") or []) if t in criteria.TONES]
+    if not cats:
+        cat = body.get("category") or None
+        if cat and cat not in criteria.CATEGORIES:
+            cat = criteria.resolve_category(cat)
+        cats = [cat] if cat else []
+    if not tones:
+        tone = body.get("tone") or None
+        tones = [tone] if tone and tone in criteria.TONES else []
+    n = max(1, min(MAX_GEN, int(body.get("count", GEN_BATCH))))
+    # Kick off in the background and return immediately; the SPA polls /api/gen
+    # for the live loading bar + count.
+    asyncio.create_task(_run_gen(request.app, cats or None, n, "manual",
+                                 tone=tones or None))
+    return aioweb.json_response(
+        {"ok": True, "started": True, "total": n,
+         "msg": f"Generating {n} stor{'ies' if n != 1 else 'y'}…"})
+
+
+async def h_gen(request):
+    return aioweb.json_response(dict(_GEN))
+
+
+async def h_costs(request):
+    return aioweb.json_response(await asyncio.to_thread(_costs_sync))
+
+
+async def h_settings(request):
+    """GET current global settings; POST {render:{...}, categories:[...]} to
+    change the production-stage defaults + which categories get generated."""
+    if request.method == "POST":
+        body = await request.json()
+        if isinstance(body.get("render"), dict):
+            await asyncio.to_thread(store.set_render_defaults, body["render"])
+        if isinstance(body.get("categories"), list):
+            valid = [c for c in body["categories"] if c in criteria.CATEGORIES]
+            await asyncio.to_thread(store.set_gen_categories, valid)
+        if "maxRenders" in body:
+            await asyncio.to_thread(store.set_render_cap, body["maxRenders"])
+        if "dailyTarget" in body:
+            await asyncio.to_thread(store.set_daily_target, body["dailyTarget"])
+        if "autogen" in body:
+            await asyncio.to_thread(store.set_autogen, body["autogen"])
+    return aioweb.json_response({
+        "render": await asyncio.to_thread(store.render_defaults),
+        "categories": await asyncio.to_thread(store.gen_categories),
+        "maxRenders": await asyncio.to_thread(store.render_cap),
+        "dailyTarget": await asyncio.to_thread(store.daily_target),
+        "autogen": await asyncio.to_thread(store.autogen_on),
+        "catalog": [{"key": k, "label": criteria.CATEGORIES[k]["label"]}
+                    for k in criteria.CATEGORY_KEYS],
+    })
+
+
+# ---- production: caption fonts + music library ------------------------------------------
+
+def _font_family(path: str) -> str | None:
+    try:
+        out = subprocess.run(["fc-scan", "--format", "%{family[0]}\n", path],
+                             capture_output=True, text=True, timeout=10)
+        fam = (out.stdout or "").splitlines()[0].strip()
+        return fam or None
+    except (OSError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+_FONT_FILES = {}          # key -> abs .ttf/.otf path (for /fontfile serving)
+
+
+def _fc_match_file(family: str) -> str | None:
+    try:
+        out = subprocess.run(["fc-match", "-f", "%{file}", family],
+                             capture_output=True, text=True, timeout=10)
+        p = (out.stdout or "").strip()
+        return p if p.lower().endswith((".ttf", ".otf")) and os.path.exists(p) \
+            else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _reg_font(name: str, path: str | None, uploaded: bool) -> dict:
+    key = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")[:48] or "font"
+    url = None
+    if path:
+        _FONT_FILES[key] = path                 # served so the browser preview
+        url = "/fontfile/" + key                # uses the *actual* font
+    return {"name": name, "url": url, "uploaded": uploaded}
+
+
+def _fonts_sync() -> list:
+    """Caption fonts: curated system families + the bundled display fonts and
+    anything uploaded (all in fonts/). Each carries a URL so the browser can
+    @font-face it and preview the real typeface."""
+    _FONT_FILES.clear()
+    installed = set()
+    try:
+        out = subprocess.run(["fc-list", ":", "family"],
+                             capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            installed.add(line.split(",")[0].strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    fonts, seen = [], set()
+    for f in CURATED_FONTS:                      # plain system fonts first
+        if f in installed:
+            fonts.append(_reg_font(f, _fc_match_file(f), False))
+            seen.add(f)
+    if os.path.isdir(render.FONTS_DIR):          # bundled display + uploaded
+        for fn in sorted(os.listdir(render.FONTS_DIR)):
+            if fn.lower().endswith((".ttf", ".otf")):
+                path = os.path.join(render.FONTS_DIR, fn)
+                fam = _font_family(path)
+                if fam and fam not in seen:
+                    fonts.append(_reg_font(fam, path, True))
+                    seen.add(fam)
+    return fonts
+
+
+async def h_fontfile(request):
+    path = _FONT_FILES.get(request.match_info["key"])
+    if not path or not os.path.exists(path):
+        raise aioweb.HTTPNotFound()
+    return aioweb.FileResponse(path, headers={"Cache-Control": "max-age=86400"})
+
+
+async def h_musicfile(request):
+    """Serve a music track for the in-browser preview player. basename() +
+    an exact directory-listing match block traversal and only serve real
+    tracks (filenames can have spaces/parens, so no aggressive sanitizing)."""
+    folder = os.path.basename(request.match_info["folder"])
+    name = os.path.basename(request.match_info["name"])
+    d = os.path.join(MUSIC_DIR, folder)
+    if os.path.isdir(d) and name in os.listdir(d) and \
+            name.lower().endswith(assemble.MUSIC_EXTS):
+        return aioweb.FileResponse(os.path.join(d, name))
+    raise aioweb.HTTPNotFound()
+
+
+async def h_production(request):
+    """Everything the Style editor needs: fonts, the music library, and the
+    caption-style option catalog."""
+    return aioweb.json_response({
+        "fonts": await asyncio.to_thread(_fonts_sync),
+        "music": await asyncio.to_thread(assemble.list_music),
+        "voices": await asyncio.to_thread(voice.list_voices),
+        "toneVoices": {k: v.get("voice") for k, v in criteria.TONES.items()},
+        "tones": [{"key": k, "label": v["label"]}
+                  for k, v in criteria.TONES.items()],
+        "sizes": list(captions.SIZE_MULT.keys()),
+        "anims": list(captions.ANIMS),
+        "positions": list(captions.POS_FRAC.keys()),
+        "swatches": ["#f2b64a", "#ffffff", "#5fe0a0", "#6ea8fe", "#f2777c",
+                     "#c084fc", "#fb923c", "#4fd1c5"],
+    })
+
+
+async def h_music_upload(request):
+    """POST multipart (folder=<tone|any>, file=<audio>) -> music/<folder>/."""
+    reader = await request.multipart()
+    folder, saved = "any", []
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "folder":
+            folder = _safe_name(await part.text(), "any")
+        elif part.name == "file" and part.filename:
+            fn = _safe_name(part.filename, "track.mp3")
+            if not fn.lower().endswith(assemble.MUSIC_EXTS):
+                continue
+            dest_dir = os.path.join(MUSIC_DIR, folder)
+            os.makedirs(dest_dir, exist_ok=True)
+            with open(os.path.join(dest_dir, fn), "wb") as f:
+                while chunk := await part.read_chunk():
+                    f.write(chunk)
+            saved.append(fn)
+    if not saved:
+        return aioweb.json_response(
+            {"ok": False, "msg": "no audio file (mp3/m4a/ogg/wav) received"})
+    return aioweb.json_response(
+        {"ok": True, "msg": f"added {', '.join(saved)} to “{folder}”",
+         "music": await asyncio.to_thread(assemble.list_music)})
+
+
+async def h_font_upload(request):
+    """POST multipart (file=<.ttf/.otf>) -> fonts/ ; returns the family name."""
+    reader = await request.multipart()
+    fam = None
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "file" and part.filename:
+            fn = _safe_name(part.filename, "font.ttf")
+            if not fn.lower().endswith((".ttf", ".otf")):
+                return aioweb.json_response(
+                    {"ok": False, "msg": "need a .ttf or .otf file"})
+            os.makedirs(render.FONTS_DIR, exist_ok=True)
+            path = os.path.join(render.FONTS_DIR, fn)
+            with open(path, "wb") as f:
+                while chunk := await part.read_chunk():
+                    f.write(chunk)
+            fam = await asyncio.to_thread(_font_family, path)
+    if not fam:
+        return aioweb.json_response({"ok": False, "msg": "no usable font file"})
+    # make it visible to fontconfig too (harmless if it fails)
+    await asyncio.to_thread(lambda: subprocess.run(
+        ["fc-cache", "-f", render.FONTS_DIR], capture_output=True, timeout=30)
+        if _has_fc_cache() else None)
+    return aioweb.json_response(
+        {"ok": True, "msg": f"added font “{fam}”", "font": fam,
+         "fonts": await asyncio.to_thread(_fonts_sync)})
+
+
+def _has_fc_cache() -> bool:
+    from shutil import which
+    return which("fc-cache") is not None
+
+
+def _md_response(text: str, filename: str):
+    return aioweb.Response(
+        text=text, content_type="text/markdown", charset="utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+async def h_brief(request):
+    sid = int(request.match_info["id"])
+    s = await asyncio.to_thread(store.get_story, sid)
+    if not s:
+        raise aioweb.HTTPNotFound()
+    text = await asyncio.to_thread(brief_text, s)
+    slug = "".join(c if c.isalnum() else "-" for c in s["title"].lower())
+    slug = "-".join(filter(None, slug.split("-")))[:60] or "story"
+    return _md_response(text, f"{slug}-brief.md")
+
+
+async def h_script(request):
+    sid = int(request.match_info["id"])
+    s = await asyncio.to_thread(store.get_story, sid)
+    if not s:
+        raise aioweb.HTTPNotFound()
+    slug = "".join(c if c.isalnum() else "-" for c in s["title"].lower())
+    slug = "-".join(filter(None, slug.split("-")))[:60] or "story"
+    return _md_response(script_text(s), f"{slug}-script.txt")
+
+
+async def h_briefs(request):
+    stories = await asyncio.to_thread(store.list_stories, "approved", 100)
+    if not stories:
+        raise aioweb.HTTPNotFound(text="nothing greenlit to export yet")
+    text = await asyncio.to_thread(export_all_text, stories)
+    return _md_response(text, f"{WORKSPACE.lower()}-production-briefs.md")
+
+
+async def h_credits(request):
+    sid = int(request.match_info["id"])
+    p = os.path.join(render.RENDERS, str(sid), "credits.txt")
+    if not os.path.exists(p):
+        raise aioweb.HTTPNotFound(text="no credits yet — render first")
+    return aioweb.FileResponse(p)
+
+
+async def h_index(request):
+    return aioweb.FileResponse(os.path.join(WEBUI, "index.html"))
+
+
+# ---- auth middleware ------------------------------------------------------------------------
+
+@aioweb.middleware
+async def auth_mw(request, handler):
+    if SECRET:
+        key = request.query.get("key") or request.cookies.get("sb_key")
+        if key != SECRET:
+            return aioweb.Response(status=401,
+                                   text="unauthorized — open /?key=<secret>")
+        resp = await handler(request)
+        if request.query.get("key") == SECRET:
+            resp.set_cookie("sb_key", SECRET, httponly=True, max_age=90 * 86400)
+        return resp
+    return await handler(request)
+
+
+def make_app(hooks: dict | None = None,
+             background: bool = False) -> aioweb.Application:
+    app = aioweb.Application(middlewares=[auth_mw])
+    app["hooks"] = hooks or {}
+    app.router.add_get("/", h_index)
+    app.router.add_get("/api/state", h_state)
+    app.router.add_get("/api/gen", h_gen)
+    app.router.add_get("/api/costs", h_costs)
+    app.router.add_get("/api/settings", h_settings)
+    app.router.add_post("/api/settings", h_settings)
+    app.router.add_get("/api/production", h_production)
+    app.router.add_get("/fontfile/{key}", h_fontfile)
+    app.router.add_get("/musicfile/{folder}/{name}", h_musicfile)
+    app.router.add_post("/api/music/upload", h_music_upload)
+    app.router.add_post("/api/fonts/upload", h_font_upload)
+    app.router.add_post("/api/story/{id:\\d+}/action", h_action)
+    app.router.add_post("/api/generate", h_generate)
+    app.router.add_get("/api/story/{id:\\d+}/brief", h_brief)
+    app.router.add_get("/api/story/{id:\\d+}/script", h_script)
+    app.router.add_get("/api/story/{id:\\d+}/credits", h_credits)
+    app.router.add_get("/api/briefs", h_briefs)
+    os.makedirs(render.RENDERS, exist_ok=True)
+    os.makedirs(render.FONTS_DIR, exist_ok=True)
+    os.makedirs(MUSIC_DIR, exist_ok=True)
+    app.router.add_static("/renders/", render.RENDERS, show_index=False)
+
+    if background:
+        # Standalone-only: auto-generate drafts through the day + run the render
+        # worker in-process. When embedded in the bot these are OFF (the bot owns
+        # its own scheduler + worker; disable storyweb before enabling the bot).
+        app["bg_tasks"] = []
+
+        async def _on_start(a):
+            a["bg_tasks"].append(asyncio.create_task(_autogen_loop(a)))
+            a["bg_tasks"].append(asyncio.create_task(_render_worker(a)))
+
+        async def _on_clean(a):
+            for t in a.get("bg_tasks", []):
+                t.cancel()
+
+        app.on_startup.append(_on_start)
+        app.on_cleanup.append(_on_clean)
+    return app
+
+
+async def start(hooks: dict | None = None):
+    """Mount inside an existing event loop (the bot). Returns the runner.
+    background=False -- the bot supplies the scheduler + render worker."""
+    runner = aioweb.AppRunner(make_app(hooks, background=False))
+    await runner.setup()
+    site = aioweb.TCPSite(runner, HOST, PORT)
+    await site.start()
+    return runner
+
+
+if __name__ == "__main__":
+    store.init_db()
+    extras = []
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        extras.append("autogen " + ("ON" if store.autogen_on()
+                                    else "off (click Generate)"))
+    extras.append("render worker")
+    print(f"OBSCURA web console (standalone) on http://{HOST}:{PORT}"
+          + (" [secret required]" if SECRET else "")
+          + f" [{', '.join(extras)}]", flush=True)
+    aioweb.run_app(make_app(background=True), host=HOST, port=PORT, print=None)

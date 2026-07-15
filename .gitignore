@@ -1,0 +1,26 @@
+# --- secrets & local config (NEVER commit) ---
+storybot.env
+*.env
+!*.env.example
+
+# --- python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- runtime data / generated output ---
+storybot.db
+storybot.db-*
+renders/
+logs/
+*.log
+
+# --- design artifacts / third-party references ---
+references/
+Story Bot (standalone).zip
+
+# --- os cruft ---
+.DS_Store
+Thumbs.db
