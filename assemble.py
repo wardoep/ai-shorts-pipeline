@@ -15,7 +15,7 @@ transition STARTS exactly on its beat boundary and the video's total length
 equals the narration's. (xfade output length = A + B - XFADE.)
 
 Encoding is software x264 on a shared 6-core box -- everything runs with
--threads 3 so renders never starve the twitch bot's transcodes.
+-threads 3 so renders never starve other services on the host.
 """
 
 import json
@@ -305,7 +305,7 @@ def make_transparent(subs_ass: str | None, narration: str, music: str | None,
 
 def make_preview(master: str, limit_bytes: int, workdir: str) -> str | None:
     """Quality-stepped copy that fits the Discord attachment limit (the
-    twitch bot's transcode-to-fit pattern). None if even 480p won't fit."""
+    same transcode-to-fit pattern used elsewhere in this project). None if even 480p won't fit."""
     for height, crf in ((1280, 28), (960, 30), (854, 33)):
         out = os.path.join(workdir, f"preview_{height}.mp4")
         tmp = out + ".part"

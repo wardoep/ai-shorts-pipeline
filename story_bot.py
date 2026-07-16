@@ -8,7 +8,7 @@ a vertical Short (voice -> footage -> captions -> assembly) and delivers a
 preview to #story-queue with Ship / Re-roll / Re-voice / Scrap buttons. Nothing
 ever auto-approves -- tiers (RECOMMENDED/REVIEW/PASS) are advisory only.
 
-Patterns follow the house bots: no privileged intents, guild-scoped slash
+Design: no privileged intents, guild-scoped slash
 commands synced in on_ready, buttons handled globally in on_interaction by
 custom_id prefix (survive restarts), blocking work via asyncio.to_thread,
 JSON-free state (sqlite via store.py). Run under systemd: storybot.service.

@@ -11,7 +11,7 @@ Runs two ways:
     polling worker picks them up whenever it runs.
 
 Auth: bind to 127.0.0.1 by default (expose via a cloudflared route +
-Cloudflare Access like helm). Optionally set STORY_WEB_SECRET -- then every
+Cloudflare Access). Optionally set STORY_WEB_SECRET -- then every
 request needs ?key=<secret> once (a cookie keeps the session).
 """
 

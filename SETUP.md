@@ -9,7 +9,7 @@ karaoke captions + music) → preview in Discord → ship.**
 1. **Discord bot** — <https://discord.com/developers/applications> → New
    Application `story bot` → Bot → Reset Token → paste into `storybot.env`
    as `STORY_DISCORD_TOKEN`. No privileged intents needed. Invite to the
-   bot! server: OAuth2 → URL Generator → scopes `bot` + `applications.commands`,
+   Your Discord server: OAuth2 → URL Generator → scopes `bot` + `applications.commands`,
    permissions: Manage Channels, Send Messages, Embed Links, Attach Files,
    Pin Messages.
 2. **Footage key — at least one of** (both free + instant):
@@ -34,7 +34,7 @@ karaoke captions + music) → preview in Discord → ship.**
 Then:
 
 ```bash
-cd /mnt/hermes/storybot
+cd /path/to/ai-shorts-pipeline
 cp storybot.env.example storybot.env   # fill in tokens
 chmod 600 storybot.env
 systemctl --user enable --now storybot
